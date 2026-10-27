@@ -1,0 +1,36 @@
+{
+  "scores": {
+    "coherence": 4.0,
+    "character_consistency": 4.0,
+    "naturalness": 4.0,
+    "restraint": 4.0,
+    "age_fit": 4.0,
+    "cultural_fit": 4.0,
+    "concept_integration": 4.0,
+    "pacing": 4.0,
+    "fun": 4.0
+  },
+  "coverage": [
+    {
+      "concept_id": "c1",
+      "line_ids": [
+        "s02_l03",
+        "s02_l05",
+        "s03_l02"
+      ],
+      "shown_in_plot": true,
+      "delivered_as": "plot_tool"
+    },
+    {
+      "concept_id": "c2",
+      "line_ids": [
+        "s03_l04",
+        "s04_l05"
+      ],
+      "shown_in_plot": true,
+      "delivered_as": "plot_tool"
+    }
+  ],
+  "explanatory_line_ratio": 0.18,
+  "issues": []
+}

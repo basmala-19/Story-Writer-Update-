@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.pytest-tmp/
+*.py[cod]
+*.egg-info/
+script_out.json
+logs/
+output/
+reports/
+tmp/
