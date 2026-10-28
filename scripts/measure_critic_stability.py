@@ -5,12 +5,11 @@
 
 Each script is judged --runs times by the same Critic (same model, prompt, settings). For every
 script it prints the score of each dimension per run, the spread, and whether the pass/fail decision
-flipped, once under the strict rule and once with the borderline re-check. It does not change any
-script. Cost: one Critic call per run (+ one small re-check call only when a dimension is borderline).
+flipped, under the strict pass rule. It does not change any
+script. Cost: one Critic call per script per run.
 
 Read the result like this:
-  flip rate (strict)   how often the decision changes between runs with NO re-check
-  flip rate (recheck)  the same with the re-check; this is the number the stage really has
+  flip rate            how often the decision differs from the majority result
   unstable dimensions  dimensions whose score changed between runs (the ones to fix in the rubric)
 """
 import argparse
@@ -26,7 +25,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from story_service.pipeline.models import Script
 from story_service.pipeline.stages import s4_writer
 from story_service.providers.llm import create_llm
-from story_service.validators.script import borderline_dimensions, critic_min_score, evaluate_critic
+from story_service.validators.script import evaluate_critic
 
 
 def build_ctx(inputs: dict) -> "s4_writer._Ctx":
@@ -42,16 +41,9 @@ def build_ctx(inputs: dict) -> "s4_writer._Ctx":
 
 
 def judge(llm, ctx, raw: dict, script: Script):
-    """One Critic pass. Returns (strict_result, recheck_result, report)."""
+    """One Critic pass under the same strict rule used by S4."""
     report = s4_writer._critic(llm, ctx, raw)
-    strict = evaluate_critic(report, concepts=ctx.concepts, script=script)
-    verdicts = None
-    border = borderline_dimensions(report, critic_min_score())
-    if border and s4_writer._recheck_enabled():
-        ids = {l.id for sc in script.scenes for l in sc.lines}
-        verdicts, _, _ = s4_writer._recheck(llm, ctx, raw, border, report, ids)
-    rechecked = evaluate_critic(report, concepts=ctx.concepts, script=script, verdicts=verdicts)
-    return strict, rechecked, report
+    return evaluate_critic(report, concepts=ctx.concepts, script=script), report
 
 
 def flip_rate(decisions: list[bool]) -> float:
@@ -74,18 +66,15 @@ def main() -> None:
     llm = create_llm()
 
     all_strict: list[float] = []
-    all_recheck: list[float] = []
     unstable_counter: dict[str, int] = defaultdict(int)
     for path in args.scripts:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
         script = Script.model_validate(raw)
         per_dim: dict[str, list[float]] = defaultdict(list)
         strict_pass: list[bool] = []
-        recheck_pass: list[bool] = []
         for _ in range(args.runs):
-            strict, rechecked, report = judge(llm, ctx, raw, script)
+            strict, report = judge(llm, ctx, raw, script)
             strict_pass.append(bool(strict["passed"]))
-            recheck_pass.append(bool(rechecked["passed"]))
             for k, v in report.scores.items():
                 per_dim[k].append(v)
         print(f"\n== {path}  ({args.runs} runs)")
@@ -96,17 +85,15 @@ def main() -> None:
                 unstable_counter[k] += 1
             sd = statistics.pstdev(vals) if len(vals) > 1 else 0.0
             print(f"  {k:22s} {vals}  sd={sd:.2f}{mark}")
-        fs, fr = flip_rate(strict_pass), flip_rate(recheck_pass)
+        fs = flip_rate(strict_pass)
         all_strict.append(fs)
-        all_recheck.append(fr)
-        print(f"  accepted: strict {sum(strict_pass)}/{args.runs}, with re-check {sum(recheck_pass)}/{args.runs}")
-        print(f"  flip rate: strict {fs:.0%}, with re-check {fr:.0%}")
+        print(f"  accepted: {sum(strict_pass)}/{args.runs}")
+        print(f"  flip rate: {fs:.0%}")
 
     t_in = sum(u["tokens_in"] for u in llm.usage)
     t_out = sum(u["tokens_out"] for u in llm.usage)
     print("\n== summary")
-    print(f"  mean flip rate (strict):  {statistics.mean(all_strict):.0%}")
-    print(f"  mean flip rate (recheck): {statistics.mean(all_recheck):.0%}")
+    print(f"  mean flip rate: {statistics.mean(all_strict):.0%}")
     if unstable_counter:
         worst = sorted(unstable_counter.items(), key=lambda kv: -kv[1])
         print("  unstable dimensions (scripts where the score changed): "

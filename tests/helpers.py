@@ -28,6 +28,7 @@ def validate(raw: dict, inputs: dict | None = None):
         age_spec=AgeSpec.model_validate(inp["age_spec"]),
         language=inp["intake"]["language"],
         wps=inp["wps"],
+        idea_constraints=(inp.get("idea") or {}).get("constraints"),
     )
 
 

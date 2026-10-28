@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from story_service.pipeline import run_log
+from story_service.pipeline.preflight import preflight_s4
 from story_service.pipeline.stages import s4_writer
 from story_service.providers.llm import create_llm
 from story_service.validators.script import failed_checks
@@ -28,24 +29,39 @@ def show_attempt(rec):
     if rec.audit_validation:
         for c in failed_checks(rec.audit_validation):
             print(f"  audit [{c['severity']}] {c['name']}: {c['detail']}")
-    if getattr(rec, "recheck_report", None):
-        for v in rec.recheck_report.get("verdicts", []):
-            state = "DEFECT " + ",".join(v.get("line_ids", [])) if v.get("defect") else "no concrete defect"
-            print(f"  recheck {v.get('dimension')}: {state}")
+    if rec.safety_validation:
+        for c in failed_checks(rec.safety_validation):
+            print(f"  safety [{c['severity']}] {c['name']}: {c['detail']}")
     if rec.critic_validation and rec.critic_validation.get("scores"):
         print(f"  critic scores: {rec.critic_validation.get('scores')}")
     if rec.critic_validation:
         for c in failed_checks(rec.critic_validation):
-            if c["name"] != "continuity_audit":
+            if c["name"] not in ("continuity_audit", "safety_audit", "safety_audit_unavailable"):
                 print(f"  critic [{c['severity']}] {c['name']}: {c['detail']}")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--inputs", default=str(ROOT / "tests/fixtures/s4/golden_inputs.json"))
-    ap.add_argument("--out", default="script_out.json")
+    ap.add_argument("--out", default="output/script_out.json")
+    ap.add_argument("--preflight-only", action="store_true",
+                    help="check and normalize S4 inputs without contacting a model")
     args = ap.parse_args()
     inputs = json.loads(Path(args.inputs).read_text(encoding="utf-8"))
+    preflight = preflight_s4(inputs)
+    for warning in preflight.warnings:
+        print(f"PREFLIGHT NOTE: {warning}")
+    for repair in preflight.repairs:
+        print(f"PREFLIGHT AUTO-FIX: {repair}")
+    if not preflight.passed:
+        print("\nPREFLIGHT FAILED before any model request:")
+        for error in preflight.errors:
+            print(f"  - {error}")
+        sys.exit(5)
+    inputs = preflight.normalized_inputs or inputs
+    if args.preflight_only:
+        print("PREFLIGHT PASSED: inputs are consistent and feasible for S4.")
+        sys.exit(0)
     llm = create_llm()
     records = []
     run_id = uuid.uuid4().hex[:8]
@@ -72,9 +88,18 @@ def main():
         script, outcome = s4_writer.run_with_outcome(**inputs, llm=llm, on_attempt=on_attempt)
     except s4_writer.ProviderFatalError as exc:
         print(f"\nSTOPPED ({exc.code}): {exc}")
-        print("Retrying cannot fix this. Check the API key/credits in .env, or lower S4_WRITER_MAX_TOKENS.")
+        if exc.status == 0:
+            print("No story retries were spent. Check internet/DNS access and the provider endpoint in .env.")
+        elif exc.status == 429:
+            print("No story retries were spent. Wait for the provider quota reset or switch provider/model in .env.")
+        else:
+            print("Retrying cannot fix this. Check the API key/credits in .env, or lower S4_WRITER_MAX_TOKENS.")
         finish("provider_error", len(records))
         sys.exit(3)
+    except s4_writer.TokenBudgetExceeded as exc:
+        print(f"\nSTOPPED (TOKEN_BUDGET_EXHAUSTED): {exc}")
+        finish("token_budget_exhausted", len(records))
+        sys.exit(4)
     except s4_writer.ValidationExhausted as exc:
         print(f"\nNEEDS REVIEW ({exc.code}) after {exc.attempts} attempts:")
         for i in exc.issues:

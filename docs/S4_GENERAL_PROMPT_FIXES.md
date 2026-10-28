@@ -46,8 +46,7 @@ leaves three", fraction notation advice). V6 removes all of it and fixes the sam
 7. Schema errors print the rejected value (e.g. the bad `emotion`).
 
 ## Not changed (deliberately)
-Thresholds (min score 4.0, mean 4.2), model/provider, advisory flag semantics. `CRITIC_MAX_EXPLANATORY` is 0.20 in
-V5 while the Module 4 spec says 0.25: decide which is intended and update the other.
+At that historical revision, the explanatory cap had not yet been reconciled. The current decision below sets it to 0.25, matching spec 04; duration tolerance remains 0.20.
 
 ## Validation
 `python -m pytest -q tests` -> 110 passed (offline, FakeLLM). No live LLM run was made, so no quality claim:
@@ -63,3 +62,15 @@ compare i1/i2 before/after with the protocol in `S4_EVALUATION_PROTOCOL.md`.
   what the narrator is about to show.
 - Critic default output budget 8000 tokens, automatic retry on truncation.
 - Regression fixture: `tests/fixtures/s4/real_run_v6_attempt3_script.json`.
+
+
+# Current policy update — 2026-10-27
+
+The notes above describe earlier revisions and are historical where they conflict with this update.
+
+- All scores below 4.0 fail; a second LLM re-check is removed. Every low score needs a category-matched issue backed by an existing script line. That evidence is diagnostic and never changes the pass threshold.
+- Safety is a semantic `safety_culture` judgment. The validator checks that safety issues cite a real line; it does not classify objects or actions by keywords.
+- Machine-checkable idea requirements are formalized at `idea.constraints` in spec 03. No requirements are inferred from free-form prose; semantic story requirements stay with the Critic.
+- The explanatory-line cap is 25% from spec 04. The 20% value elsewhere in older notes meant duration tolerance (`DURATION_TOLERANCE`), not explanatory lines.
+- Continuity audit calls are conditional (otherwise-passing candidate or Critic continuity issue). `MAX_TOKENS_PER_STORY` caps aggregate usage.
+- `scripts/compare_versions.py` runs repeated comparisons and saves outputs, prompt hashes, and an unfilled human-review queue under `reports/`. Live benchmark runs remain intentionally unexecuted until a token budget is chosen.

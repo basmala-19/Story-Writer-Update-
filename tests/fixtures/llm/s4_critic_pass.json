@@ -32,5 +32,28 @@
     }
   ],
   "explanatory_line_ratio": 0.18,
-  "issues": []
+  "issues": [],
+  "fact_checks": [
+    {
+      "concept_id": "c1",
+      "line_ids": [
+        "s02_l03",
+        "s02_l05",
+        "s03_l02"
+      ],
+      "story_claim": "The whole is divided into equal parts and the fraction describes one part.",
+      "source_basis": "The supplied concept defines a fraction as a part of a whole divided into equal parts.",
+      "verdict": "supported"
+    },
+    {
+      "concept_id": "c2",
+      "line_ids": [
+        "s03_l04",
+        "s04_l05"
+      ],
+      "story_claim": "The bottom number is the denominator and the top number is the numerator.",
+      "source_basis": "The supplied concept defines numerator and denominator by their positions and meanings.",
+      "verdict": "supported"
+    }
+  ]
 }

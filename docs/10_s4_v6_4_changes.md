@@ -1,3 +1,5 @@
+> **Historical note (2026-10-27):** This changelog describes the earlier re-check implementation. It has since been removed. Current S4 policy: all scores below 4.0 fail; low scores require category-matched evidence on a real line, without a second LLM call. See `DECISIONS.md`.
+
 # S4 — V6.4: إعادة فحص الدرجات الحدودية + قياس ثبات الـ Critic
 
 ## المشكلة
@@ -20,8 +22,8 @@
 ## التكلفة
 نداء إضافي صغير فقط لما تظهر درجة حدودية. مفيش تكرار للـ Critic على كل قصة.
 
-## لسه مفتوح
-- 0.20 مقابل 0.25 للجمل الشارحة: سبناها 0.20 (فيه تيست بيثبتها). قرار عمر.
+## قرارات حالية حلّت البنود المفتوحة
+- حد الجمل الشارحة 0.25 وفق spec 04؛ أما 0.20 فهي سماحية تقدير المدة.
 - قرار اللهجة (خيار أ/ب).
 - معايرة مقابل تقييم بشري مرجعي (محتاجة 30-50 قصة مقيّمة بشريًا) — مش متعملة.
 - اقتراح S3 (تفضيل الأفكار قليلة المستلمين) مش في الـ repo ده.

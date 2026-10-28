@@ -28,6 +28,7 @@ SCOPED_CODE_CHECKS = {
     "near_duplicate_lines",
     "interaction_position",
     "spoken_display_similarity",
+    "dialogue_self_stage_direction",
 }
 
 # Failed Critic/audit rules that mean the plot structure itself must change.

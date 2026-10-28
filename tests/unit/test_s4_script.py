@@ -1,4 +1,5 @@
 import copy
+import json
 import re
 
 import pytest
@@ -17,6 +18,7 @@ from story_service.pipeline.models import (
     ChooseAnswer,
     Concepts,
     CriticReport,
+    EducationalAccuracyReport,
     DragMatch,
     Predict,
     Script,
@@ -26,6 +28,7 @@ from story_service.pipeline.stages import s4_writer
 from story_service.pipeline.text_utils import norm_ar
 from story_service.providers.llm.fake import FakeLLM
 from story_service.validators.script import evaluate_critic
+from story_service.validators.script import evaluate_educational_accuracy
 
 
 # --------------------------------------------------------------------------- #
@@ -98,14 +101,68 @@ def test_narrator_share_failure_gets_a_concrete_repair_hint():
     assert "speaker limit" in hint
 
 
+def test_speaker_limit_repair_preserves_required_child_group_as_silent_participants():
+    inp = load_inputs("golden")
+    inp["idea"]["constraints"] = {"required_child_count": 4}
+    ctx = s4_writer._Ctx(
+        intake=s4_writer.Intake.model_validate(inp["intake"]),
+        concepts=s4_writer.Concepts.model_validate(inp["concepts"]),
+        brief=s4_writer.Brief.model_validate(inp["brief"]),
+        idea=s4_writer.Idea.model_validate(inp["idea"]),
+        age_spec=s4_writer.AgeSpec.model_validate(inp["age_spec"]),
+        speech_style=s4_writer.SpeechStyle.model_validate(inp["speech_style"]),
+        wps={"ar": 2.4, "en": 2.7},
+    )
+    validation = {"checks": [{
+        "name": "speaker_limit", "passed": False, "severity": "blocker",
+        "detail": "4 speakers (max 3)",
+        "data": {"actual": 4, "limit": 3, "speakers": [
+            {"key": "lead", "name": "Lead", "role": "protagonist", "line_count": 7},
+            {"key": "friend_a", "name": "Friend A", "role": "supporting", "line_count": 6},
+            {"key": "friend_b", "name": "Friend B", "role": "supporting", "line_count": 1},
+            {"key": "friend_c", "name": "Friend C", "role": "supporting", "line_count": 2},
+        ]},
+    }]}
+    hint = s4_writer._remedy_hints(ctx, validation)
+    assert "at most 3 distinct non-narrator speaker keys" in hint
+    assert "at least 4 distinct named child participants" in hint
+    assert "Friend B (`friend_b`; 1 line(s))" in hint
+    assert "Keep them in `characters`" in hint
+    assert "do not exceed the narrator-share limit" in hint
+    assert "Merge or drop" not in hint
+
+
+def test_retries_carry_forward_prior_hard_failures_and_return_best_draft():
+    first = golden_script()
+    _five_speakers(first)
+    second = golden_script()
+    _too_much_narrator(second)
+    second["title"] = "best hard-check candidate"
+    third = copy.deepcopy(first)
+    self_action = line(third, "s04_l01")
+    self_action["speaker"] = "nadia"
+    self_action["text_display"] = "أخذت القطعة ووضعتها هنا."
+    self_action["text_spoken"] = self_action["text_display"]
+
+    llm = FakeLLM([first, second, third])
+    with pytest.raises(s4_writer.ValidationExhausted) as caught:
+        s4_writer.run(**load_inputs("golden"), llm=llm, max_attempts=3)
+
+    prompts = [call["user"] for call in llm.calls_for("writer")]
+    assert "speaker_limit" in prompts[1]
+    assert "speaker_limit" in prompts[2] and "narrator_share" in prompts[2]
+    assert caught.value.last_script.title == "best hard-check candidate"
+    assert any("narrator_share" in issue["message"] for issue in caught.value.issues)
 
 
 def test_critic_prompt_requires_line_evidence_for_plot_tool_and_notation_order():
-    from story_service.pipeline.prompting import PROMPT_DIR
-    prompt = (PROMPT_DIR / "s4_critic.md").read_text(encoding="utf-8")
+    from story_service.pipeline.prompting import load_prompt
+    prompt = load_prompt("s4_critic.md")
     assert "A term, definition, recap, or interaction quiz alone is not evidence" in prompt
-    assert "cannot be described as already holding/eating a piece" in prompt
+    assert "detailed state/count ledger" in prompt
     assert "problem it helps with is still open" in " ".join(prompt.split())
+    assert "Independently recompute arithmetic and place values" in prompt
+    assert "fact_checks" in prompt and "source_basis" in prompt
 
 def test_writer_prompt_has_required_output_checklist():
     prompt, _ = s4_writer.build_writer_messages(
@@ -122,14 +179,56 @@ def test_writer_prompt_has_required_output_checklist():
     )
     assert "silently check" in prompt
     assert "including\n`recap_line_ids`" in prompt
-    assert "exactly 5 scenes" in _
-    assert "35-40 lines total" in _
+    assert "exactly 6 scenes" in _
+    assert "36-42 lines total" in _
 
 
 def test_golden_passes_every_code_check_with_no_warnings():
     script, res = validate(golden_script())
     assert script is not None and res["passed"]
     assert all(c["passed"] for c in res["checks"])
+
+
+def test_deterministic_validator_does_not_make_keyword_safety_decisions():
+    raw = golden_script()
+    unsafe_line = line(raw, "s01_l01")
+    unsafe_line["text_display"] = "أخذت نادية سكينًا وحدها."
+    unsafe_line["text_spoken"] = unsafe_line["text_display"]
+    _, result = validate(raw)
+    assert "unsafe_child_tool_use" not in {c["name"] for c in result["checks"]}
+
+
+def test_validator_catches_speaker_narrating_their_own_action_by_name():
+    raw = golden_script()
+    action_line = line(raw, "s01_l04")
+    action_line["speaker"] = "nadia"
+    action_line["text_display"] = "أخذت نادية البيتزا ووضعتها على الطاولة بحذر."
+    action_line["text_spoken"] = action_line["text_display"]
+    _, result = validate(raw)
+    check = next(c for c in result["checks"] if c["name"] == "dialogue_self_stage_direction")
+    assert not check["passed"] and "s01_l04" in check["detail"]
+
+
+def test_validator_allows_first_person_spoken_decision_about_an_action():
+    raw = golden_script()
+    action_line = line(raw, "s01_l04")
+    action_line["speaker"] = "nadia"
+    action_line["text_display"] = "سأضع البطاقة هنا يا جدو."
+    action_line["text_spoken"] = action_line["text_display"]
+    _, result = validate(raw)
+    check = next(c for c in result["checks"] if c["name"] == "dialogue_self_stage_direction")
+    assert check["passed"]
+
+
+def test_validator_catches_arabic_first_person_past_action_without_pronoun_or_name():
+    raw = golden_script()
+    action_line = line(raw, "s01_l04")
+    action_line["speaker"] = "nadia"
+    action_line["text_display"] = "وكتبت الكسر هنا لنعرف حصة كل فرد."
+    action_line["text_spoken"] = action_line["text_display"]
+    _, result = validate(raw)
+    check = next(c for c in result["checks"] if c["name"] == "dialogue_self_stage_direction")
+    assert not check["passed"] and "s01_l04" in check["detail"]
 
 
 def test_digits_only_in_display():
@@ -269,6 +368,10 @@ def test_mutation_fails_named_check(label, mutate, expected):
     assert expected in failed_names(res), f"{label}: expected '{expected}', got {failed_names(res)}"
     blockers = [c for c in res["checks"] if c["name"] == expected and not c["passed"]]
     assert all(c["severity"] == "blocker" for c in blockers)
+    if expected == "speaker_limit":
+        check = blockers[0]
+        assert check["data"]["actual"] == 5 and check["data"]["limit"] == 3
+        assert all("key" in speaker and "line_count" in speaker for speaker in check["data"]["speakers"])
 
 
 def test_too_short_duration_fails():
@@ -396,6 +499,105 @@ def test_critic_golden_passes_with_mean_428():
     assert res["passed"] and res["scores"]["mean"] == 4.28
 
 
+def test_critic_requires_source_fact_review_for_each_required_concept():
+    script = Script.model_validate(golden_script())
+    assert evaluate_critic(_critic(), concepts=CONCEPTS, script=script)["passed"]
+
+    missing = _critic(fact_checks=[])
+    result = evaluate_critic(missing, concepts=CONCEPTS, script=script)
+    check = next(c for c in result["checks"] if c["name"] == "critic_fact_accuracy")
+    assert not check["passed"] and "missing source-fact review" in check["detail"]
+
+
+def test_independent_fact_supplement_also_runs_continuity_audit():
+    inputs = load_inputs("golden")
+    critic = _critic().model_dump(mode="json")
+    first_fact = critic["fact_checks"][0]
+    omitted_line = first_fact["line_ids"].pop()
+    assert omitted_line in next(
+        item["line_ids"] for item in critic["coverage"]
+        if item["concept_id"] == first_fact["concept_id"]
+    )
+    claims = []
+    for concept in inputs["concepts"]["concepts"]:
+        if concept["weight"] != "must":
+            continue
+        coverage = next(item for item in critic["coverage"] if item["concept_id"] == concept["id"])
+        claims.append({
+            "concept_id": concept["id"], "line_ids": coverage["line_ids"],
+            "claim": "The educational claim follows the provided concept.",
+            "source_quote": concept["definition"],
+            "reasoning": "The claim agrees with the cited concept definition.",
+            "verdict": "supported",
+        })
+    raw = golden_script()
+    continuity = {
+        "reviewed_line_ids": [line["id"] for sc in raw["scenes"] for line in sc["lines"]],
+        "reviewed_interaction_ids": [sc["interaction"]["id"] for sc in raw["scenes"]
+                                     if isinstance(sc.get("interaction"), dict)],
+        "ledger": [], "issues": [],
+    }
+    llm = FakeLLM("s4_script.json", critic=critic,
+                  fact_accuracy={"claims": claims}, continuity=continuity)
+    _, outcome = s4_writer.run_with_outcome(
+        **inputs, llm=llm, fact_accuracy_audit=True, continuity_audit=True, safety_audit=False,
+    )
+    assert outcome.status == "accepted"
+    assert len(llm.calls_for("continuity")) == 1
+
+
+def test_critic_rejects_contradicted_or_uncited_educational_claims():
+    script = Script.model_validate(golden_script())
+    facts = [fact.model_dump() for fact in _critic().fact_checks]
+    facts[0]["verdict"] = "contradicted"
+    result = evaluate_critic(_critic(fact_checks=facts), concepts=CONCEPTS, script=script)
+    check = next(c for c in result["checks"] if c["name"] == "critic_fact_accuracy")
+    assert not check["passed"] and "contradicted" in check["detail"]
+
+    facts = [fact.model_dump() for fact in _critic().fact_checks]
+    facts[0]["line_ids"].remove("s02_l03")
+    result = evaluate_critic(_critic(fact_checks=facts), concepts=CONCEPTS, script=script)
+    check = next(c for c in result["checks"] if c["name"] == "critic_fact_accuracy")
+    assert not check["passed"] and "not fact-checked" in check["detail"]
+
+
+def test_independent_accuracy_audit_requires_verbatim_source_and_all_required_claims():
+    inputs = load_inputs("golden")
+    script = Script.model_validate(golden_script())
+    source_text = inputs["intake"]["topic_text"] + "\n" + json.dumps(inputs["concepts"], ensure_ascii=False)
+    claims = []
+    for concept in inputs["concepts"]["concepts"]:
+        if concept["weight"] != "must":
+            continue
+        lines = next(c for c in _critic().coverage if c.concept_id == concept["id"]).line_ids
+        claims.append({
+            "concept_id": concept["id"], "line_ids": lines[:1], "claim": "A story claim about this concept.",
+            "source_quote": concept["definition"], "reasoning": "It agrees with the quoted definition.",
+            "verdict": "supported",
+        })
+    report = EducationalAccuracyReport.model_validate({"claims": claims})
+    required = {line_id for fact in _critic().fact_checks for line_id in fact.line_ids}
+    result = evaluate_educational_accuracy(report, concepts=CONCEPTS, script=script,
+                                           source_text=source_text, required_line_ids=required)
+    assert not result["passed"]  # only a subset of cited instructional lines was audited
+
+    claims = []
+    for concept in inputs["concepts"]["concepts"]:
+        if concept["weight"] != "must":
+            continue
+        cited = next(c for c in _critic().fact_checks if c.concept_id == concept["id"]).line_ids
+        claims.append({
+            "concept_id": concept["id"], "line_ids": cited, "claim": "A story claim about this concept.",
+            "source_quote": "unquoted paraphrase", "reasoning": "This was not checked against the source.",
+            "verdict": "supported",
+        })
+    result = evaluate_educational_accuracy(
+        EducationalAccuracyReport.model_validate({"claims": claims}), concepts=CONCEPTS, script=script,
+        source_text=source_text, required_line_ids=required,
+    )
+    assert not result["passed"] and "not verbatim" in result["checks"][0]["detail"]
+
+
 def test_critic_flat_4_0_fails_only_the_mean_rule():
     rep = CriticReport.model_validate(load_llm_fixture("s4_critic_flat4.json"))
     res = evaluate_critic(rep, concepts=CONCEPTS)
@@ -419,9 +621,9 @@ def test_critic_one_low_score_fails():
         (lambda d: d["coverage"][0].update(shown_in_plot=False), "critic_must_as_plot_tool"),
         (lambda d: d["coverage"].pop(), "critic_must_as_plot_tool"),
         (lambda d: d.update(explanatory_line_ratio=0.31), "critic_explanatory_ratio"),
-        (lambda d: d["issues"].append({"severity": "blocker", "scene_id": "s02", "line_id": None,
+        (lambda d: d["issues"].append({"severity": "blocker", "category": "concept", "scene_id": "s02", "line_id": None,
                                        "message": "teaches later topic", "fix_hint": "remove"}), "critic_issues"),
-        (lambda d: d["issues"].append({"severity": "major", "scene_id": "s03", "line_id": "s03_l04",
+        (lambda d: d["issues"].append({"severity": "major", "category": "lecture", "scene_id": "s03", "line_id": "s03_l04",
                                        "message": "reads like a textbook", "fix_hint": "rephrase"}), "critic_issues"),
     ],
 )
@@ -435,9 +637,41 @@ def test_critic_failures(mutate, expected):
 
 def test_critic_minor_issue_is_only_a_warning():
     d = load_llm_fixture("s4_critic_pass.json")
-    d["issues"].append({"severity": "minor", "scene_id": "s01", "line_id": None, "message": "polish", "fix_hint": None})
+    d["issues"].append({"severity": "minor", "category": "other", "scene_id": "s01", "line_id": None, "message": "polish", "fix_hint": None})
     res = evaluate_critic(CriticReport.model_validate(d), concepts=CONCEPTS)
     assert res["passed"]
+
+
+def test_minor_recap_redundancy_is_promoted_to_a_required_repair():
+    script = Script.model_validate(golden_script())
+    recap_line_id = script.recap_line_ids[0]
+    report = _critic(issues=[{
+        "severity": "minor", "category": "redundancy", "scene_id": "s05",
+        "line_id": recap_line_id, "message": "The recap repeats the lesson definition.",
+        "fix_hint": "Make it reflect the character's action instead.",
+    }])
+    result = evaluate_critic(report, concepts=CONCEPTS, script=script)
+    issue_check = next(c for c in result["checks"] if c["name"] == "critic_issues")
+    assert not issue_check["passed"] and "[major/redundancy]" in issue_check["detail"]
+
+
+@pytest.mark.parametrize("category", ["continuity", "stage_direction"])
+def test_line_backed_continuity_and_stage_direction_cannot_be_downgraded(category):
+    report = _critic(issues=[{
+        "severity": "minor", "category": category, "scene_id": "s02", "line_id": "s02_l03",
+        "message": "A concrete defect appears on this line.", "fix_hint": "Show the action first.",
+    }])
+    assert report.issues[0].severity == "major"
+    result = evaluate_critic(report, concepts=CONCEPTS)
+    issue_check = next(c for c in result["checks"] if c["name"] == "critic_issues")
+    assert not issue_check["passed"]
+    assert f"[major/{category}]" in issue_check["detail"]
+
+
+def test_critic_issue_category_is_required():
+    issue = {"severity": "major", "scene_id": "s02", "line_id": "s02_l03", "message": "issue"}
+    with pytest.raises(ValidationError):
+        CriticReport.model_validate({**_bad_critic(), "issues": [issue]})
 
 
 def test_important_concepts_need_80_percent():
@@ -447,6 +681,11 @@ def test_important_concepts_need_80_percent():
     cov = lambda ids: [{"concept_id": c, "line_ids": ["s01_l01"], "shown_in_plot": True, "delivered_as": "plot_tool"} for c in ids]
     base = load_llm_fixture("s4_critic_pass.json")
     base["coverage"] = cov(["c1", "c2", "c3", "c4", "c5"])  # 4 of 5 important = 80%
+    base["fact_checks"] = [
+        {"concept_id": c, "line_ids": ["s01_l01"], "story_claim": "claim",
+         "source_basis": "source", "verdict": "supported"}
+        for c in ("c1", "c2", "c3", "c4", "c5")
+    ]
     assert evaluate_critic(CriticReport.model_validate(base), concepts=concepts)["passed"]
     base["coverage"] = cov(["c1", "c2", "c3", "c4"])  # 3 of 5 = 60%
     assert not evaluate_critic(CriticReport.model_validate(base), concepts=concepts)["passed"]
@@ -473,10 +712,11 @@ def _bad_critic(**changes):
     return d
 
 
-def test_lecture_for_c1_reruns_writer_with_report():
+def test_lecture_for_c1_reruns_writer_with_report(monkeypatch):
+    monkeypatch.setattr(s4_writer, "MAX_INPUT_TOKENS", None)
     d = _bad_critic()
     d["coverage"][0]["delivered_as"] = "lecture"
-    d["issues"] = [{"severity": "major", "scene_id": "s02", "line_id": "s02_l05",
+    d["issues"] = [{"severity": "major", "category": "lecture", "scene_id": "s02", "line_id": "s02_l05",
                     "message": "c1 is explained in textbook wording", "fix_hint": "let a character use it"}]
     llm = FakeLLM("s4_script.json", critic=[d, "s4_critic_pass.json"])
     records = []
@@ -540,6 +780,71 @@ def test_three_critic_failures_exhaust_validation(critic):
     assert "critic_" in str(exc.value)
     assert exc.value.last_script is not None
     assert [r.attempt for r in records] == [1, 2, 3] and not any(r.passed for r in records)
+
+
+def test_source_fact_error_is_repaired_before_acceptance():
+    bad = _bad_critic()
+    bad["fact_checks"][0]["verdict"] = "contradicted"
+    bad["fact_checks"][0]["story_claim"] = "The stated quantitative relation is incorrect."
+    bad["issues"] = [{
+        "severity": "blocker", "category": "concept", "scene_id": "s02",
+        "line_id": "s02_l03", "message": "The claim conflicts with the supplied lesson.",
+        "fix_hint": "Recalculate the example from the source and correct the dependent lines.",
+    }]
+    llm = FakeLLM("s4_script.json", critic=[bad, "s4_critic_pass.json"])
+    records = []
+    story, outcome = s4_writer.run_with_outcome(
+        **load_inputs("golden"), llm=llm, on_attempt=records.append,
+        continuity_audit=False, safety_audit=False,
+    )
+    assert outcome.status == "accepted" and outcome.attempt == 2
+    assert [record.passed for record in records] == [False, True]
+    repair_prompt = llm.calls_for("writer")[1]["user"]
+    assert "critic_fact_accuracy" in repair_prompt
+    assert "Recompute quantities independently" in repair_prompt
+
+
+def test_independent_accuracy_auditor_blocks_then_allows_repaired_candidate():
+    inputs = load_inputs("golden")
+    critic = _bad_critic()
+    source_claims = []
+    for concept in inputs["concepts"]["concepts"]:
+        if concept["weight"] != "must":
+            continue
+        coverage = next(c for c in critic["coverage"] if c["concept_id"] == concept["id"])
+        source_claims.append({
+            "concept_id": concept["id"], "line_ids": coverage["line_ids"],
+            "claim": "The story's educational claim matches the lesson.",
+            "source_quote": concept["definition"], "reasoning": "The stated relation follows from the source.",
+            "verdict": "supported",
+        })
+    contradicted = copy.deepcopy(source_claims)
+    contradicted[0]["verdict"] = "contradicted"
+    llm = FakeLLM(
+        "s4_script.json", critic="s4_critic_pass.json",
+        fact_accuracy=[{"claims": contradicted}, {"claims": source_claims}],
+    )
+    records = []
+    story, outcome = s4_writer.run_with_outcome(
+        **inputs, llm=llm, on_attempt=records.append, continuity_audit=False, safety_audit=False,
+        fact_accuracy_audit=True,
+    )
+    assert outcome.status == "accepted" and outcome.attempt == 2
+    assert [record.passed for record in records] == [False, True]
+    assert "educational_accuracy_audit" in records[0].fact_accuracy_validation["checks"][0]["name"]
+    assert "educational_accuracy_audit" in llm.calls_for("writer")[1]["user"]
+    assert "Correct the cited line from the supplied lesson" in s4_writer._critic_hints(
+        records[0].critic_validation
+    )
+
+
+def test_independent_accuracy_auditor_fails_closed_when_unavailable():
+    with pytest.raises(s4_writer.ValidationExhausted) as exc:
+        s4_writer.run(
+            **load_inputs("golden"), llm=FakeLLM("s4_script.json", critic="s4_critic_pass.json"),
+            max_attempts=1, continuity_audit=False, safety_audit=False, fact_accuracy_audit=True,
+        )
+    assert "educational_accuracy_audit_unavailable" in str(exc.value)
 
 
 def test_max_attempts_is_configurable():
@@ -660,7 +965,7 @@ def test_budget_and_feedback_give_concrete_fixes():
     }
     fb = w._format_feedback(val, None, None, ctx)
     assert "ADD about 139 spoken words" in fb
-    assert "at most 3 speaking characters" in fb and "8 lines between" in fb
+    assert "at most 3 distinct non-narrator speaker keys" in fb and "8 lines between" in fb
 
 
 def test_retry_prompt_contains_previous_script_and_recap_is_restored():
@@ -689,6 +994,7 @@ def test_previous_script_shrinks_to_fit_input_cap(monkeypatch):
         wps={"ar": 2.4, "en": 2.7},
     )
     prev = json.loads((Path(__file__).parents[1] / "fixtures/llm/s4_script.json").read_text(encoding="utf-8"))
+    monkeypatch.setattr(w, "MAX_INPUT_TOKENS", None)
     base = sum(len(x) for x in w.build_writer_messages(ctx, "fb"))
     full_len = sum(len(x) for x in w.build_writer_messages(ctx, "fb", prev))
 
@@ -709,7 +1015,7 @@ def test_critic_feedback_is_compact_and_actionable():
     report = {
         "scores": {"coherence": 3.5},
         "coverage": [{"concept_id": "c1", "line_ids": [], "shown_in_plot": True, "delivered_as": "lecture"}],
-        "issues": [{"severity": "major", "scene_id": "s04", "line_id": "s04_l04",
+        "issues": [{"severity": "major", "category": "continuity", "scene_id": "s04", "line_id": "s04_l04",
                     "message": "bad piece", "fix_hint": "use quarters only"}],
     }
     crit_val = {"passed": False, "checks": [
@@ -719,6 +1025,23 @@ def test_critic_feedback_is_compact_and_actionable():
     fb = w._format_feedback({"passed": True, "checks": []}, report, crit_val)
     assert "use quarters only" in fb and "ACTION" in fb and "never introduce new quantities" in fb
     assert '"coverage"' not in fb and '"scores"' not in fb
+
+
+def test_continuity_repair_preserves_the_current_narrator_budget():
+    from story_service.pipeline.stages import s4_writer as w
+
+    report = {"issues": [{"severity": "major", "category": "continuity",
+                          "scene_id": "s03", "line_id": "s03_l02",
+                          "message": "a completed action is not established"}]}
+    code = {"passed": True, "checks": [{"name": "narrator_share", "passed": True,
+                                          "severity": "blocker", "detail": "",
+                                          "data": {"narrator": 11, "total": 38, "cap": 13}}]}
+    review = {"passed": False, "checks": [{"name": "continuity_audit", "passed": False,
+                                              "severity": "major", "detail": "show the action"}]}
+    feedback = w._format_feedback(code, report, review)
+    assert "currently has 11 narrator lines out of 38" in feedback
+    assert "merge an essential action into an existing nearby narrator line" in feedback
+    assert "rephrase an action that has not happened as a plan or question" in feedback
 
 
 @pytest.mark.parametrize(
@@ -741,43 +1064,59 @@ def test_unrelated_spoken_text_still_fails_with_digits_in_display():
     assert spoken_display_ratio("أكلت 1/4 البيتزا", "ذهب الولد إلى المدرسة صباحا") < MIN_SIMILARITY
 
 
-def test_critic_explanatory_ratio_default_is_twenty_percent(monkeypatch):
+def test_critic_explanatory_ratio_default_matches_the_s4_spec(monkeypatch):
     from story_service.validators.script import evaluate_critic
 
     monkeypatch.delenv("S4_CRITIC_MAX_EXPLANATORY", raising=False)
     concepts = Concepts.model_validate(load_inputs("golden")["concepts"])
     report_data = _bad_critic()
-    report_data["explanatory_line_ratio"] = 0.21
+    report_data["explanatory_line_ratio"] = 0.24
     report = CriticReport.model_validate(report_data)
     result = evaluate_critic(report, concepts=concepts)
     failed = {c["name"] for c in result["checks"] if not c["passed"]}
-    assert "critic_explanatory_ratio" in failed
+    assert "critic_explanatory_ratio" not in failed
+    report_data["explanatory_line_ratio"] = 0.26
+    result = evaluate_critic(CriticReport.model_validate(report_data), concepts=concepts)
+    assert "critic_explanatory_ratio" in {c["name"] for c in result["checks"] if not c["passed"]}
 
 
 def test_critic_prompt_defers_code_owned_checks_and_defines_natural_term_use():
-    from pathlib import Path
+    from story_service.pipeline.prompting import load_prompt
 
-    prompt = (Path(__file__).parents[2] / "src/story_service/pipeline/prompts/s4_critic.md").read_text()
+    prompt = load_prompt("s4_critic.md")
     assert "Do not create a speaker-count/limit issue" in prompt
     assert "a character naturally using a required term" in prompt
-    assert "20% of all lines" in prompt
+    assert "25% of all lines" in prompt
 
 
-def test_critic_thresholds_can_be_relaxed_from_env(monkeypatch):
-    from story_service.pipeline.models import CriticReport
+def test_idea_constraints_count_is_explicit_and_measurable():
+    raw = golden_script()
+    raw["characters"] = [c for c in raw["characters"] if c["key"] != "omar"]
+    inputs = load_inputs("golden")
+    inputs["idea"]["constraints"] = {"required_child_count": 4}
+    _, result = validate(raw, inputs=inputs)
+    check = next(c for c in result["checks"] if c["name"] == "idea_required_child_count")
+    assert not check["passed"] and check["data"]["required"] == 4
+
+
+def test_critic_thresholds_cannot_be_relaxed_through_environment(monkeypatch):
     from story_service.validators.script import evaluate_critic
 
     d = _bad_critic()
     d["explanatory_line_ratio"] = 0.58
+    d["scores"] = {**d["scores"], "fun": 3.5}
     report = CriticReport.model_validate(d)
-    monkeypatch.delenv("S4_CRITIC_MAX_EXPLANATORY", raising=False)
     concepts = Concepts.model_validate(load_inputs("golden")["concepts"])
-    assert not evaluate_critic(report, concepts=concepts)["passed"]
     monkeypatch.setenv("S4_CRITIC_MAX_EXPLANATORY", "0.7")
-    assert evaluate_critic(report, concepts=concepts)["passed"]
+    monkeypatch.setenv("S4_CRITIC_MIN_SCORE", "3.0")
+    monkeypatch.setenv("S4_CRITIC_MIN_MEAN", "3.0")
+    result = evaluate_critic(report, concepts=concepts)
+    failed = {c["name"] for c in result["checks"] if not c["passed"]}
+    assert {"critic_each_score", "critic_explanatory_ratio"} <= failed
 
 
 def test_advisory_critic_revises_then_returns_best(monkeypatch):
+    monkeypatch.setattr(s4_writer, "MAX_INPUT_TOKENS", None)
     for name in ("S4_CRITIC_ADVISORY", "S4_CRITIC_MAX_EXPLANATORY", "S4_CRITIC_MIN_SCORE", "S4_CRITIC_MIN_MEAN", "S4_MAX_ATTEMPTS"):
         monkeypatch.delenv(name, raising=False)
     worse = _bad_critic()
@@ -848,32 +1187,127 @@ def test_repair_prompt_contains_state_count_audit():
 
 
 def test_writer_prompt_separates_spoken_dialogue_from_physical_actions():
-    from story_service.pipeline.prompting import PROMPT_DIR
-    prompt = (PROMPT_DIR / "s4_writer.md").read_text(encoding="utf-8")
+    from story_service.pipeline.prompting import load_prompt
+    prompt = load_prompt("s4_writer.md")
     assert "Physical actions, gestures, movement, object handling, and visible results belong in a narrator line" in prompt
     assert "must not narrate their own gesture" in prompt
 
 
 def test_writer_prompt_resolves_required_terms_without_definition_dialogue():
-    from story_service.pipeline.prompting import PROMPT_DIR
-    prompt = (PROMPT_DIR / "s4_writer.md").read_text(encoding="utf-8")
-    assert "Use required terms without turning dialogue into a definition" in prompt
-    assert "Avoid definition-shaped sentences" in prompt
+    from story_service.pipeline.prompting import load_prompt
+    prompt = load_prompt("s4_writer.md")
+    assert "TERMS WITHOUT A LECTURE" in prompt
+    assert "Do not define it, list" in prompt
+    assert "technical terms absent from the selected lesson" in prompt
 
 
 def test_critic_prompt_defers_deterministic_structure_checks_to_code():
-    from story_service.pipeline.prompting import PROMPT_DIR
-    prompt = (PROMPT_DIR / "s4_critic.md").read_text(encoding="utf-8")
-    assert "Do not report these as Critic issues" in prompt
+    from story_service.pipeline.prompting import load_prompt
+    prompt = load_prompt("s4_critic.md")
+    assert "Do not restate them as Critic issues" in prompt
     assert "Do not create a speaker-count/limit issue" in prompt
 
 
-def test_critic_prompt_distinguishes_narrated_actions_from_spoken_words():
-    from story_service.pipeline.prompting import PROMPT_DIR
-    prompt = (PROMPT_DIR / "s4_critic.md").read_text(encoding="utf-8")
-    assert "moving the action to the narrator" in prompt
-    assert "Do not mistake a natural spoken decision or reaction for a stage direction" in prompt
+def test_critic_prompt_requires_explicit_child_tool_safety_audit():
+    from story_service.pipeline.prompting import load_prompt
+    prompt = load_prompt("s4_critic.md")
+    assert "Safety appraisal (mandatory before scoring)" in prompt
+    assert "consider that character's age and ability" in prompt
+    assert "explicitly establishes a suitable adult's help" in prompt
+    assert "report a blocker in `safety_culture` with the exact real line id" in prompt
+    assert "Do not rely on a fixed keyword list" in prompt
 
+
+def test_critic_request_omits_writer_only_localization_catalogs():
+    inputs = load_inputs("golden")
+    ctx = s4_writer._Ctx(
+        intake=s4_writer.Intake.model_validate(inputs["intake"]),
+        concepts=s4_writer.Concepts.model_validate(inputs["concepts"]),
+        brief=s4_writer.Brief.model_validate(inputs["brief"]),
+        idea=s4_writer.Idea.model_validate(inputs["idea"]),
+        age_spec=s4_writer.AgeSpec.model_validate(inputs["age_spec"]),
+        speech_style=s4_writer.SpeechStyle.model_validate(inputs["speech_style"]),
+        wps=inputs["wps"],
+    )
+    _, user = s4_writer.build_critic_messages(ctx, golden_script())
+    assert "names_female" not in user and "typical_prices" not in user
+    assert "sensitivities" in user and "school_context" in user and "humor_notes" in user
+
+
+def test_critic_prompt_distinguishes_narrated_actions_from_spoken_words():
+    from story_service.pipeline.prompting import load_prompt
+    prompt = load_prompt("s4_critic.md")
+    assert "moving the action to the narrator" in prompt
+    assert "Do not mistake a natural spoken decision or reaction for a" in re.sub(r"\s+", " ", prompt)
+
+
+def test_continuity_auditor_tracks_who_performed_each_action():
+    from story_service.pipeline.prompting import load_prompt
+    prompt = load_prompt("s4_continuity.md")
+    assert "who performs each action" in prompt
+    assert "cannot claim to have performed an action" in prompt
+    assert "identity and preparation/condition" in prompt
+    assert "do not silently rename one state as another" in prompt
+    assert "rephrase the line as a plan or question" in prompt
+    assert "combining it with an existing nearby narrator line" in prompt
+
+
+def test_critic_prompt_checks_unexplained_object_state_changes():
+    from story_service.pipeline.prompting import load_prompt
+    critic = load_prompt("s4_critic.md")
+    continuity = load_prompt("s4_continuity.md")
+    assert "detailed state/count ledger" in critic
+    assert "Build a compact ledger" in continuity
+    assert "identity and preparation/condition" in continuity
+    assert "count that does not add up" in continuity
+
+
+def test_writer_prompt_has_topic_neutral_action_and_state_examples():
+    from story_service.pipeline.prompting import load_prompt
+    prompt = load_prompt("s4_writer.md")
+    assert "WRONG: Salma says" in prompt
+    assert "a cup of water cannot become" in prompt
+    assert "mistaken plan from an action that already happened" in prompt
+    assert "actions must be appropriate for the characters’ ages and setting" in prompt
+    assert "A repair must be physically" in prompt
+    assert "gathering or pressing it" in prompt
+
+
+def test_writer_and_critic_prompts_preserve_essential_idea_participants():
+    from story_service.pipeline.prompting import load_prompt
+    writer = load_prompt("s4_writer.md")
+    critic = load_prompt("s4_critic.md")
+    assert "idea.constraints.required_child_count" in writer and "essential named participants" in writer
+    assert "idea.constraints" in critic and "Silent characters are allowed" in critic
+
+
+def test_writer_and_critic_prompts_preserve_action_to_explanation_order_and_dialogue_style():
+    from story_service.pipeline.prompting import load_prompt
+    writer = load_prompt("s4_writer.md")
+    critic = load_prompt("s4_critic.md")
+    assert "one short, natural line in their own words" in writer
+    assert "immediately after the action and visible result" in writer
+    assert "before any line that explains the rule" in writer
+    assert "immediately after the action and visible result" in critic
+    assert "one brief, natural character reaction" in critic
+    assert "hard to understand alone" in critic
+
+
+def test_idea_constraints_check_names_and_literal_evidence():
+    raw = golden_script()
+    inp = load_inputs("golden")
+    inp["idea"]["constraints"] = {
+        "required_participants": ["نادية", "كريم"],
+        "concept_evidence": [{"concept_id": "c2", "required_terms": ["المقام", "البسط"],
+                              "required_any_forms": ["1/4", "واحد على أربعة"]}],
+    }
+    _, result = validate(raw, inputs=inp)
+    checks = {c["name"]: c for c in result["checks"]}
+    assert checks["idea_required_participants"]["passed"]
+    assert checks["idea_concept_evidence"]["passed"]
+    inp["idea"]["constraints"]["required_participants"] = ["اسم غير موجود"]
+    _, result = validate(raw, inputs=inp)
+    assert not next(c for c in result["checks"] if c["name"] == "idea_required_participants")["passed"]
 
 
 # --------------------------------------------------------------------------- #
@@ -883,14 +1317,30 @@ TOPIC_WORDS = ("pizza", "fraction", "numerator", "denominator", "بيتزا", "�
 
 
 def test_prompts_and_retry_hints_contain_no_topic_or_character_specifics():
-    from story_service.pipeline.prompting import PROMPT_DIR
+    from story_service.pipeline.prompting import load_prompt
 
-    texts = [(PROMPT_DIR / n).read_text(encoding="utf-8") for n in ("s4_writer.md", "s4_critic.md")]
+    texts = [load_prompt(n) for n in ("s4_writer.md", "s4_critic.md")]
     texts += list(s4_writer.CATEGORY_REPAIR.values())
     texts.append(s4_writer._critic_hints({"checks": [
         {"name": n, "passed": False, "severity": "major", "detail": ""}
-        for n in ("critic_must_as_plot_tool", "critic_explanatory_ratio", "critic_issues", "critic_each_score")
+        for n in ("critic_fact_accuracy", "critic_must_as_plot_tool", "critic_explanatory_ratio",
+                  "critic_issues", "critic_each_score")
     ], "scores": {"fun": 3.0}}))
+    texts.append(s4_writer._remedy_hints(
+        s4_writer._Ctx(
+            intake=s4_writer.Intake.model_validate(load_inputs("golden")["intake"]),
+            concepts=s4_writer.Concepts.model_validate(load_inputs("golden")["concepts"]),
+            brief=s4_writer.Brief.model_validate(load_inputs("golden")["brief"]),
+            idea=s4_writer.Idea.model_validate(load_inputs("golden")["idea"]),
+            age_spec=s4_writer.AgeSpec.model_validate(load_inputs("golden")["age_spec"]),
+            speech_style=s4_writer.SpeechStyle.model_validate(load_inputs("golden")["speech_style"]),
+            wps=load_inputs("golden")["wps"],
+        ),
+        {"checks": [
+            {"name": "contract_participants", "passed": False, "severity": "blocker", "detail": "missing"},
+            {"name": "contract_concept_evidence", "passed": False, "severity": "blocker", "detail": "missing"},
+        ]},
+    ))
     blob = "\n".join(texts).casefold()
     assert [w for w in TOPIC_WORDS if w.casefold() in blob] == []
 
@@ -901,6 +1351,32 @@ def test_must_concept_feedback_is_action_not_definition():
     hint = s4_writer._critic_hints(validation)
     assert "Use ACTION, not a definition" in hint
     assert "still open" in hint
+
+
+def test_source_accuracy_feedback_requires_rechecking_all_dependent_claims():
+    hint = s4_writer._critic_hints({"checks": [{"name": "critic_fact_accuracy", "passed": False,
+                                                 "severity": "blocker", "detail": "wrong value"}]})
+    assert "Recompute quantities independently" in hint
+    assert "interaction, and recap" in hint
+
+
+def test_independent_accuracy_prompt_contains_only_grounded_inputs():
+    inputs = load_inputs("golden")
+    ctx = s4_writer._Ctx(
+        intake=s4_writer.Intake.model_validate(inputs["intake"]),
+        concepts=Concepts.model_validate(inputs["concepts"]),
+        brief=s4_writer.Brief.model_validate(inputs["brief"]),
+        idea=s4_writer.Idea.model_validate(inputs["idea"]),
+        age_spec=s4_writer.AgeSpec.model_validate(inputs["age_spec"]),
+        speech_style=s4_writer.SpeechStyle.model_validate(inputs["speech_style"]),
+        wps=inputs["wps"],
+    )
+    system, user = s4_writer.build_fact_accuracy_messages(ctx, golden_script())
+    assert "independent educational-accuracy auditor" in system
+    assert "Check the claim against the lesson source" in " ".join(user.split())
+    assert "1/4" in user and "find every factual or educational claim" in user.casefold()
+    assert "imaginary events and fantasy mechanisms are creative fiction" in user
+    assert "{{lesson}}" not in user and "{{script}}" not in user
 
 
 def test_low_score_feedback_names_the_weakest_dimensions():
@@ -923,6 +1399,15 @@ def test_repair_guide_follows_critic_category_not_keywords():
     assert "Humor:" not in guide  # minor issues get no guide
     assert s4_writer._category_repair_hint({"issues": [report["issues"][2]]}) == ""
     assert s4_writer._category_repair_hint(None) == ""
+
+
+def test_continuity_repair_guide_requires_an_explicit_reversal_or_repair():
+    report = {"issues": [{
+        "severity": "major", "category": "continuity", "message": "state reset", "fix_hint": "show the fix",
+    }]}
+    guide = s4_writer._category_repair_hint(report)
+    assert "Do not silently undo or reset a state shown earlier" in guide
+    assert "Make repairs physically plausible for the material" in guide
 
 
 def test_feedback_lists_blockers_before_minor_issues():
@@ -983,8 +1468,9 @@ def test_critic_plot_tool_claim_needs_a_real_cited_line():
     bad["coverage"][0]["line_ids"] = ["s99_l01"]
     res = evaluate_critic(CriticReport.model_validate(bad), concepts=concepts, script=script)
     assert not res["passed"] and "critic_evidence" in failed_names(res)
-    # without the script the old behaviour is unchanged
-    assert evaluate_critic(CriticReport.model_validate(bad), concepts=concepts)["passed"]
+    # Without a script, the omitted cited line is still visible as an incomplete fact audit.
+    result = evaluate_critic(CriticReport.model_validate(bad), concepts=concepts)
+    assert not result["passed"] and "critic_fact_accuracy" in failed_names(result)
 
 
 def test_best_failed_attempt_ranking_is_severity_aware():
@@ -996,6 +1482,19 @@ def test_best_failed_attempt_ranking_is_severity_aware():
     low_scores_only = s4_writer._candidate_rank(ok_scores, {"issues": []}, 1)
     assert low_scores_only > s4_writer._candidate_rank(must_bad, {"issues": []}, 2)
     assert s4_writer._candidate_rank(must_bad, {"issues": []}, 2) > s4_writer._candidate_rank(must_bad, blocker_rep, 3)
+
+
+def test_best_attempt_can_prefer_a_last_code_failure_over_multiple_prior_major_issues():
+    prior = {"checks": [{"name": "continuity_audit", "passed": False,
+                         "severity": "major", "detail": "two state errors"}],
+             "scores": {"mean": 4.5}}
+    last_code = {"checks": [{"name": "narrator_share", "passed": False,
+                             "severity": "blocker", "detail": "one line over limit"}]}
+    prior_rank = s4_writer._candidate_rank(
+        prior, {"issues": [{"severity": "major"}, {"severity": "major"}]}, 2, code_valid=True
+    )
+    last_rank = s4_writer._candidate_rank(last_code, None, 3, code_valid=False)
+    assert last_rank > prior_rank
 
 
 def test_outcome_is_accepted_on_pass_and_needs_review_for_fallback(monkeypatch):
@@ -1052,11 +1551,11 @@ def _real_run_script() -> dict:
     return json.loads((FIXTURES / "s4" / "real_run_v6_attempt3_script.json").read_text(encoding="utf-8"))
 
 
-def test_real_run_script_passes_code_checks_and_only_the_answer_leak_is_reported():
+def test_real_run_script_flags_spoken_action_report_and_answer_leak():
     _, res = validate(_real_run_script())
-    assert res["passed"]
     failed = [c["name"] for c in res["checks"] if not c["passed"]]
-    assert failed == ["interaction_answer_leak"]  # s04_i1: "1/4" was written two lines earlier
+    assert "dialogue_self_stage_direction" in failed  # speaker reports taking a piece as dialogue
+    assert "interaction_answer_leak" in failed  # s04_i1: "1/4" was written two lines earlier
 
 
 def test_unknown_emotion_is_mapped_instead_of_failing_the_attempt():
@@ -1086,10 +1585,10 @@ def test_writer_budget_states_the_narrator_cap_in_lines():
 
 
 def test_critic_prompt_sets_severity_for_reraised_confusion_and_unlisted_actors():
-    from story_service.pipeline.prompting import PROMPT_DIR
+    from story_service.pipeline.prompting import load_prompt
 
-    prompt = " ".join((PROMPT_DIR / "s4_critic.md").read_text(encoding="utf-8").split())
-    assert "already corrected and that comes back later" in prompt
+    prompt = " ".join(load_prompt("s4_critic.md").split())
+    assert "character already corrected and that comes back later" in prompt
     assert "not in `characters`" in prompt and "at least \"major\"" in prompt
 
 
@@ -1153,20 +1652,121 @@ def test_fatal_provider_status_stops_at_once(status):
     assert len(llm.calls_for("writer")) == 0 or len(llm.calls_for("writer")) == 1
 
 
-def test_transient_provider_status_is_still_retried():
+def test_provider_quota_status_stops_without_rewriting_the_story():
     def boom(_user):
         raise _ProviderStatus(429)
 
     llm = FakeLLM([boom, "s4_script.json"], critic="s4_critic_pass.json")
-    out = s4_writer.run(**load_inputs("golden"), llm=llm)
-    assert isinstance(out, Script)
+    with pytest.raises(s4_writer.ProviderFatalError) as exc:
+        s4_writer.run(**load_inputs("golden"), llm=llm)
+    assert exc.value.status == 429
+    assert len(llm.calls_for("writer")) == 1
 
 
 def test_writer_prompt_has_order_naturalness_and_last_scene_rules():
     from story_service.pipeline.prompting import load_prompt
 
     p = load_prompt("s4_writer.md")
-    assert "ORDER INSIDE A SCENE" in p and "NATURAL CHILD SPEECH" in p and "LAST SCENE" in p
-    assert "do not add a new incident just to fill time" in p
-    assert "affects the ending" in p
-    assert "Never invent a tool name" in p
+    assert "ACTION AND CONTINUITY" in p and "NATURAL VOICE" in p and "ENDING" in p
+    assert "Do not add an unrelated incident or repeat" in p
+    assert "appropriate for the characters’ ages and setting" in p
+
+
+def test_active_spec_thresholds_match_validator_constants():
+    from pathlib import Path
+    from story_service.validators import script as validator
+    root = Path(__file__).resolve().parents[2]
+    spec = (root / "docs/04_story_writer_critic.md").read_text(encoding="utf-8")
+    protocol = (root / "docs/S4_EVALUATION_PROTOCOL.md").read_text(encoding="utf-8")
+    assert f"{validator.CRITIC_MAX_EXPLANATORY:.0%}" in spec
+    assert f"{validator.CRITIC_MAX_EXPLANATORY:.2f}" in protocol
+    assert "±20%" in spec and validator.DURATION_TOLERANCE == 0.20
+    assert "0.25" in protocol and validator.CRITIC_MAX_EXPLANATORY == 0.25
+
+
+def test_prompt_modules_expand_and_prompt_hash_covers_included_files():
+    from story_service.pipeline.prompting import load_prompt, prompt_hash, prompt_sources
+    assert "{{include:" not in load_prompt("s4_writer.md")
+    assert "{{include:" not in load_prompt("s4_critic.md")
+    assert "s4_writer_rules.md" in prompt_sources("s4_writer.md")
+    assert "s4_critic_audits.md" in prompt_sources("s4_critic.md")
+    assert len(prompt_hash("s4_critic.md")) == 64
+
+
+def test_semantic_safety_issue_requires_a_real_script_line():
+    from story_service.pipeline.models import Script
+    script = Script.model_validate(golden_script())
+    report_data = _bad_critic()
+    report_data["issues"] = [{"severity": "blocker", "category": "safety_culture",
+        "line_id": "s99_l99", "scene_id": "s99", "message": "unsafe action", "fix_hint": "revise"}]
+    result = evaluate_critic(CriticReport.model_validate(report_data), concepts=CONCEPTS, script=script)
+    assert "critic_score_evidence" in {c["name"] for c in result["checks"] if not c["passed"]}
+
+
+def test_story_token_cap_rejects_before_calling_the_model():
+    from story_service.pipeline.models import Script
+    fake = FakeLLM("s4_script.json")
+    budgeted = s4_writer._TokenBudgetedLLM(fake, limit=1)
+    with pytest.raises(s4_writer.TokenBudgetExceeded):
+        budgeted.complete_json("system", "user", Script, max_tokens=10)
+    assert fake.calls == []
+
+
+def test_idea_rejects_legacy_unstructured_requirement_fields():
+    inputs = load_inputs("golden")
+    idea = dict(inputs["idea"])
+    idea["required_participant_count"] = 4
+    with pytest.raises(ValidationError, match="move legacy idea requirements"):
+        s4_writer.Idea.model_validate(idea)
+
+
+@pytest.mark.parametrize(
+    ("category", "line_id", "message", "fix_hint"),
+    [
+        ("continuity", "s02_l03", "The stated quantity contradicts the earlier event.",
+         "Reconcile the quantities and recheck every dependent line."),
+        ("redundancy", "s03_l02", "This line repeats the same idea without a new beat.",
+         "Keep the stronger line and give the scene a new action."),
+        ("lecture", "s02_l04", "The character explains the rule instead of acting on it.",
+         "Turn the explanation into a choice or action that advances the problem."),
+        ("clarity", "s04_l01", "The scene summary claims an event that the scene does not show.",
+         "Align the summary with the events actually shown in the scene."),
+    ],
+)
+def test_semantic_regression_cases_feed_auditor_evidence_into_repair(
+    category, line_id, message, fix_hint, monkeypatch
+):
+    """Fixed Critic reports test repair handling, not the model's ability to detect defects."""
+    monkeypatch.setattr(s4_writer, "MAX_INPUT_TOKENS", None)
+    bad = _bad_critic()
+    bad["issues"] = [{
+        "severity": "major", "category": category, "scene_id": line_id.split("_")[0],
+        "line_id": line_id, "message": message, "fix_hint": fix_hint,
+    }]
+    llm = FakeLLM("s4_script.json", critic=[bad, "s4_critic_pass.json"])
+    records = []
+    s4_writer.run(
+        **load_inputs("golden"), llm=llm, on_attempt=records.append,
+        continuity_audit=False, safety_audit=False, fact_accuracy_audit=False,
+    )
+    assert len(llm.calls_for("critic")) == 2
+    repair_prompt = llm.calls_for("writer")[1]["user"]
+    assert category in repair_prompt
+    assert message in repair_prompt
+    assert fix_hint in repair_prompt
+    assert records[0].passed is False and records[1].passed is True
+
+
+def test_auditor_observability_uses_observed_calls_and_unknown_usage_is_null():
+    records = []
+    s4_writer.run(
+        **load_inputs("golden"), llm=FakeLLM("s4_script.json", critic="s4_critic_pass.json"),
+        on_attempt=records.append, continuity_audit=False, safety_audit=False,
+        fact_accuracy_audit=False,
+    )
+    metric = records[0].auditor_metrics["critic"]
+    assert metric["llm_calls"] == 1
+    assert metric["duration_ms"] >= 0
+    assert metric["tokens_in"] is None and metric["tokens_out"] is None
+    assert metric["estimated_cost_usd"] is None
+    assert metric["cost_status"] == "unavailable_no_dated_price"

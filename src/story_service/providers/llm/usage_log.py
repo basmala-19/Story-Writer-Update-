@@ -10,7 +10,7 @@ from typing import Any
 DEFAULT_USAGE_LOG_PATH = "logs/llm_usage.jsonl"
 
 
-def record_usage(*, provider: str, model: str, model_role: str, tokens_in: int, tokens_out: int) -> dict[str, Any]:
+def record_usage(*, provider: str, model: str, model_role: str, tokens_in: int | None, tokens_out: int | None) -> dict[str, Any]:
     """Append one successful LLM call to the configured JSON Lines log.
 
     The log deliberately contains only metering metadata--never prompts,
@@ -24,6 +24,9 @@ def record_usage(*, provider: str, model: str, model_role: str, tokens_in: int, 
         "model_role": model_role,
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
+        # Cost stays unknown unless a dated provider/model price is explicitly configured.
+        "estimated_cost_usd": None,
+        "cost_status": "unavailable_no_dated_price",
     }
     path = Path(os.getenv("LLM_USAGE_LOG_PATH", DEFAULT_USAGE_LOG_PATH))
     path.parent.mkdir(parents=True, exist_ok=True)

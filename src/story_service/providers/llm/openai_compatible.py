@@ -37,8 +37,8 @@ class OpenAICompatibleLLM:
             provider=self.provider,
             model=self.models[role],
             model_role=role,
-            tokens_in=usage.prompt_tokens if usage else 0,
-            tokens_out=usage.completion_tokens if usage else 0,
+            tokens_in=getattr(usage, "prompt_tokens", None) if usage else None,
+            tokens_out=getattr(usage, "completion_tokens", None) if usage else None,
         )
         self.usage.append(event)
         choice = response.choices[0]

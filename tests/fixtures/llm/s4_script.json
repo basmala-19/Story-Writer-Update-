@@ -33,6 +33,22 @@
       "traits": [
         "calm"
       ]
+    },
+    {
+      "key": "youssef",
+      "name": "يوسف",
+      "role": "supporting",
+      "gender": "m",
+      "age_years": 9,
+      "traits": ["observant"]
+    },
+    {
+      "key": "omar",
+      "name": "عمر",
+      "role": "supporting",
+      "gender": "m",
+      "age_years": 9,
+      "traits": ["patient"]
     }
   ],
   "scenes": [
@@ -246,8 +262,8 @@
           "id": "s04_l01",
           "speaker": "narrator",
           "emotion": "neutral",
-          "text_display": "وصل الأصدقاء الأربعة، وأخذ كل واحد جزءًا من البيتزا الكبيرة.",
-          "text_spoken": "وصل الأصدقاء الأربعة وأخذ كل واحد جزءا من البيتزا الكبيرة"
+          "text_display": "وصل يوسف وعمر إلى المطبخ، وأخذ كل واحد جزءًا من البيتزا الكبيرة.",
+          "text_spoken": "وصل يوسف وعمر إلى المطبخ وأخذ كل واحد جزءا من البيتزا الكبيرة"
         },
         {
           "id": "s04_l02",

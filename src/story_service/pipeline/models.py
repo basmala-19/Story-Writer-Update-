@@ -216,6 +216,33 @@ class CoverageEntry(_Strict):
     delivered_as: Literal["plot_tool", "lecture", "mention"]
 
 
+class ConceptFactCheck(_Strict):
+    """Source-grounded accuracy review for educational claims in cited concept lines."""
+
+    concept_id: str
+    line_ids: list[str] = Field(min_length=1)
+    story_claim: str = Field(min_length=1)
+    source_basis: str = Field(min_length=1)
+    verdict: Literal["supported", "contradicted", "uncertain"]
+
+
+class EducationalClaim(_Strict):
+    """Independent audit of a factual/educational claim in a generated line."""
+
+    concept_id: str
+    line_ids: list[str] = Field(min_length=1)
+    claim: str = Field(min_length=1)
+    source_quote: str = Field(min_length=1)
+    reasoning: str = Field(min_length=1)
+    verdict: Literal["supported", "contradicted", "uncertain"]
+
+
+class EducationalAccuracyReport(_Strict):
+    ROUTE: ClassVar[str] = "fact_accuracy"
+
+    claims: list[EducationalClaim]
+
+
 ISSUE_CATEGORIES = (
     "continuity",      # object/quantity/order of events, state claimed before or after it is true
     "redundancy",      # same information, joke or conclusion repeated
@@ -237,11 +264,17 @@ class CriticIssue(_Strict):
     category: Literal[
         "continuity", "redundancy", "lecture", "naturalness", "stage_direction", "clarity",
         "character", "concept", "pacing", "humor", "safety_culture", "other",
-    ] | None = None
+    ]
     scene_id: str | None = None
     line_id: str | None = None
     message: str
     fix_hint: str | None = None
+
+    @model_validator(mode="after")
+    def _line_backed_defects_are_major(self) -> CriticIssue:
+        if self.line_id is not None and self.category in {"continuity", "stage_direction"}:
+            self.severity = "major" if self.severity == "minor" else self.severity
+        return self
 
 
 class CriticReport(_Strict):
@@ -249,6 +282,7 @@ class CriticReport(_Strict):
 
     scores: dict[str, float]
     coverage: list[CoverageEntry]
+    fact_checks: list[ConceptFactCheck] = Field(default_factory=list)
     explanatory_line_ratio: float = Field(ge=0, le=1)
     issues: list[CriticIssue] = Field(default_factory=list)
 
@@ -262,22 +296,6 @@ class CriticReport(_Strict):
         if bad:
             raise ValueError(f"scores outside 1..5: {bad}")
         return self
-
-
-class DimensionVerdict(_Strict):
-    dimension: str
-    defect: bool                      # True only when a concrete defect can be pointed at
-    line_ids: list[str] = Field(default_factory=list)
-    evidence: str = ""                # one sentence: the quoted words and why they fail the dimension
-    fix_hint: str | None = None
-
-
-class RecheckReport(_Strict):
-    """Second, narrow look at the borderline score dimensions of a Critic report."""
-
-    ROUTE: ClassVar[str] = "recheck"
-
-    verdicts: list[DimensionVerdict] = Field(default_factory=list)
 
 
 class LedgerEntry(_Strict):
@@ -300,8 +318,38 @@ class ContinuityReport(_Strict):
 
     ROUTE: ClassVar[str] = "continuity"
 
+    reviewed_line_ids: list[str] = Field(default_factory=list)
+    reviewed_interaction_ids: list[str] = Field(default_factory=list)
     ledger: list[LedgerEntry] = Field(default_factory=list)
     issues: list[ContinuityIssue] = Field(default_factory=list)
+
+
+class HazardEntry(_Strict):
+    """One place where a character performs an action that could plausibly cause harm."""
+
+    line_id: str           # the line that shows or states the action
+    scene_id: str
+    handler: str           # cast key of whoever performs it, or "unspecified" if the line does not say
+    hazard: str            # short English description of the action and what makes it risky
+    risk_category: Literal[
+        "sharp_tool", "heat_flame", "height_fall", "water", "electricity",
+        "chemical", "traffic", "heavy_object", "other",
+    ] = "other"
+    safeguard: Literal["adult_helping", "child_safe_tool", "none"]
+    safeguard_line_id: str | None = None   # the line that establishes the safeguard, if any
+    # How bad a slip would be for THIS handler: "serious" = an injury that needs care; "minor" = at
+    # most a scratch or bruise (ordinary tasks a child of that age does alone). Code blocks only serious.
+    risk: Literal["serious", "minor"] = "serious"
+
+
+class SafetyReport(_Strict):
+    """Structured safety audit. The model only extracts who does what; code decides pass/fail by
+    checking the cited lines against the script's own cast (no word lists)."""
+
+    ROUTE: ClassVar[str] = "safety"
+
+    reviewed_line_ids: list[str] = Field(default_factory=list)
+    hazards: list[HazardEntry] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -341,6 +389,22 @@ class Concepts(_Loose):
         return [c.id for c in self.concepts if not weights or c.weight in weights]
 
 
+class ConceptEvidenceContract(_Strict):
+    """Literal evidence the S4 code validator can verify without another model call."""
+
+    concept_id: str
+    required_terms: list[str] = Field(default_factory=list)
+    required_any_forms: list[str] = Field(default_factory=list)
+
+
+class IdeaConstraints(_Strict):
+    """Machine-checkable numeric/name/text constraints owned by the selected idea."""
+
+    required_child_count: int | None = Field(default=None, ge=1)
+    required_participants: list[str] = Field(default_factory=list)
+    concept_evidence: list[ConceptEvidenceContract] = Field(default_factory=list)
+
+
 class Idea(_Loose):
     id: str
     logline: str
@@ -349,6 +413,18 @@ class Idea(_Loose):
     concept_moments: list[dict]
     tone: str = ""
     one_liner: str = ""
+    constraints: IdeaConstraints = Field(default_factory=IdeaConstraints)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_unstructured_constraints(cls, value):
+        if isinstance(value, dict):
+            legacy = {"acceptance_contract", "required_participant_count"} & value.keys()
+            if legacy:
+                raise ValueError(
+                    "move legacy idea requirements into idea.constraints: " + ", ".join(sorted(legacy))
+                )
+        return value
 
 
 class AgeSpec(_Strict):

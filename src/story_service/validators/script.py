@@ -7,7 +7,6 @@ Both return `{passed, checks: [{name, passed, severity, detail}], scores?}` (spe
 from __future__ import annotations
 
 import itertools
-import os
 import re
 from difflib import SequenceMatcher
 from typing import Any
@@ -19,7 +18,10 @@ from story_service.pipeline.models import (
     AgeSpec,
     Concepts,
     CriticReport,
+    EducationalAccuracyReport,
+    SafetyReport,
     Script,
+    IdeaConstraints,
 )
 from story_service.pipeline.text_utils import estimate_line_seconds, norm_ar, word_count
 
@@ -31,7 +33,7 @@ MIN_INTERACTION_GAP_SEC = 20.0
 MIN_SIMILARITY = 0.6
 CRITIC_MIN_SCORE = 4.0
 CRITIC_MIN_MEAN = 4.2
-CRITIC_MAX_EXPLANATORY = 0.20
+CRITIC_MAX_EXPLANATORY = 0.25
 IMPORTANT_MIN_RATIO = 0.80
 NEAR_DUPLICATE_RATIO = 0.80   # token-sequence similarity of two lines that counts as the same line
 NEAR_DUPLICATE_MIN_TOKENS = 6  # shorter lines ("Okay, let's go") may legitimately repeat
@@ -46,17 +48,25 @@ _WESTERN = re.compile("[0-9]")
 _HTML_TAG = re.compile(r"<\s*/?\s*[A-Za-z!]")
 # Stage directions written inside a line: "(she smiles)", "[points]", "*laughs*".
 _STAGE_MARKUP = re.compile(r"[()\[\]{}*]")
-
-
-def _env_float(name: str, default: float) -> float:
-    """Critic thresholds can be relaxed from .env during development (read lazily, at call time)."""
-    value = os.getenv(name)
-    if not value:
-        return default
-    try:
-        return float(value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a number, got {value!r}") from exc
+_PHYSICAL_ACTION_AR = re.compile(
+    r"(?:أخذ|اخذ|أمسك|امسك|حمل|وضع|وضعت|مد|فتح|أغلق|اغلق|طوى|قص|قطع|"
+    r"نقل|حرّك|حرك|رفع|أدار|ادار|أشار|اشار|لمس|سحب|دفع|صب|"
+    r"أخذت|امسكت|حملت|وضعت|فتحت|طوت|قصت|قطعت|نقلت|رفعت|أشارت|اشارت|"
+    r"مسكت|سحبت|دفعت|صبت)"
+)
+_PHYSICAL_ACTION_EN = re.compile(
+    r"\b(?:take|takes|took|hold|holds|held|carry|carries|carried|put|puts|"
+    r"place|places|placed|open|opens|opened|close|closes|closed|fold|folds|"
+    r"folded|cut|cuts|move|moves|moved|lift|lifts|lifted|point|points|pointed)\b",
+    re.IGNORECASE,
+)
+_COMPLETED_PHYSICAL_ACTIONS_AR = {
+    "اخذت", "امسكت", "مسكت", "حملت", "وضعت", "مددت", "فتحت", "اغلقت", "طويت",
+    "قصصت", "قطعت", "نقلت", "رفعت", "ادرت", "اشرت", "لمست", "سحبت", "دفعت",
+    "صببت", "كتبت", "رسمت", "احضرت", "جمعت", "رتبت", "قسمت", "وزعت", "اعدت",
+    "مسحت", "ثبتت", "التقطت", "قست", "لففت", "حركت", "ادخلت", "اخرجت",
+}
+_FIRST_PERSON_AR = {"انا", "نحن", "احنا"}
 
 
 def _check(name: str, passed: bool, detail: str = "", severity: str = "blocker") -> dict[str, Any]:
@@ -157,6 +167,95 @@ def _all_strings(obj: Any):
             yield from _all_strings(v)
 
 
+def _speaker_self_stage_directions(script: Script) -> list[str]:
+    """Catch explicit third-person self-narration of physical action in dialogue.
+
+    This intentionally requires both the speaker's own name and an action verb. It avoids
+    flagging ordinary first-person decisions such as “I'll put it here,” which belong in dialogue.
+    """
+    by_key = {character.key: character.name for character in script.characters}
+    problems: list[str] = []
+    for scene in script.scenes:
+        for line in scene.lines:
+            if line.speaker == "narrator" or line.speaker not in by_key:
+                continue
+            name = by_key[line.speaker].strip()
+            text = f"{line.text_display} {line.text_spoken}"
+            named_action = bool(name) and bool(
+                re.search(re.escape(name), text, re.IGNORECASE)
+                and (_PHYSICAL_ACTION_AR.search(text) or _PHYSICAL_ACTION_EN.search(text))
+            )
+            tokens = norm_ar(text).split()
+            first_person_action = any(
+                token in _FIRST_PERSON_AR and any(t in _COMPLETED_PHYSICAL_ACTIONS_AR for t in tokens[i + 1:i + 5])
+                for i, token in enumerate(tokens)
+            )
+            # Arabic often drops “I”. A completed, physical verb at the start of a spoken clause
+            # (e.g. “وكتبت المقام...”) is therefore treated as self-action unless another named
+            # character is explicitly the actor. Future plans such as “سأكتب” remain dialogue.
+            for i, token in enumerate(tokens):
+                verb = token[1:] if token.startswith(("و", "ف")) else token
+                clause_start = i == 0 or token.startswith(("و", "ف")) or tokens[i - 1] == "ثم"
+                other_actor = any(
+                    norm_ar(other_name) in tokens[i + 1:i + 4]
+                    for key, other_name in by_key.items()
+                    if key != line.speaker and other_name.strip()
+                )
+                if clause_start and verb in _COMPLETED_PHYSICAL_ACTIONS_AR and not other_actor:
+                    first_person_action = True
+                    break
+            if named_action or first_person_action:
+                problems.append(f"{line.id}: speaker reports a physical action in dialogue")
+    return problems
+
+
+def _compact_ar(text: str) -> str:
+    """Normalize Arabic/number strings for literal contract checks, ignoring spacing/punctuation."""
+    return re.sub(r"\s+", "", norm_ar(text))
+
+
+def _idea_constraints_checks(
+    script: Script, constraints: IdeaConstraints, known_concepts: set[str]
+) -> list[dict[str, Any]]:
+    lines = [line for scene in script.scenes for line in scene.lines]
+    story_text = _compact_ar(" ".join(f"{line.text_display} {line.text_spoken}" for line in lines))
+    by_name = {_compact_ar(c.name): c for c in script.characters if c.name}
+    speaking_keys = {line.speaker for line in lines}
+    missing = []
+    for name in constraints.required_participants:
+        key = _compact_ar(name)
+        character = by_name.get(key)
+        if not character or (key not in story_text and character.key not in speaking_keys):
+            missing.append(name)
+    checks = []
+    if constraints.required_participants:
+        checks.append(_check("idea_required_participants", not missing,
+                             f"missing named participants: {missing}", severity="blocker"))
+    if constraints.required_child_count is not None:
+        present = [c for c in script.characters if c.age_years < 18 and c.name and
+                   (_compact_ar(c.name) in story_text or c.key in speaking_keys)]
+        actual = len({c.key for c in present})
+        check = _check("idea_required_child_count", actual >= constraints.required_child_count,
+                       f"idea requires at least {constraints.required_child_count} distinct named child participants; {actual} appear",
+                       severity="blocker")
+        check["data"] = {"required": constraints.required_child_count, "actual": actual}
+        checks.append(check)
+    evidence_issues = []
+    for evidence in constraints.concept_evidence:
+        if evidence.concept_id not in known_concepts:
+            evidence_issues.append(f"{evidence.concept_id}: unknown concept")
+            continue
+        missing_terms = [term for term in evidence.required_terms if _compact_ar(term) not in story_text]
+        if missing_terms:
+            evidence_issues.append(f"{evidence.concept_id}: missing required terms {missing_terms}")
+        if evidence.required_any_forms and not any(_compact_ar(form) in story_text for form in evidence.required_any_forms):
+            evidence_issues.append(f"{evidence.concept_id}: no required form appears")
+    if constraints.concept_evidence:
+        checks.append(_check("idea_concept_evidence", not evidence_issues,
+                             "; ".join(evidence_issues[:10]), severity="blocker"))
+    return checks
+
+
 # --------------------------------------------------------------------------- #
 # script validation
 # --------------------------------------------------------------------------- #
@@ -168,8 +267,11 @@ def validate_script(
     language: str,
     wps: dict[str, float],
     display_digits: str = "western",
+    idea_constraints: IdeaConstraints | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
+    if isinstance(idea_constraints, dict):
+        idea_constraints = IdeaConstraints.model_validate(idea_constraints)
     scenes = script.scenes
     lines = [l for s in scenes for l in s.lines]
     known_concepts = set(concepts.ids())
@@ -213,11 +315,36 @@ def validate_script(
     checks.append(_check("speakers_known", not unknown, f"unknown speakers: {unknown}"))
     non_narrator = {l.speaker for l in lines if l.speaker != "narrator"}
     limit = age_spec.max_speakers - 1
+    speaker_check = _check(
+        "speaker_limit",
+        len(non_narrator) <= limit,
+        f"{len(non_narrator)} speaking characters (max {limit} plus narrator)",
+    )
+    if len(non_narrator) > limit:
+        characters_by_key = {c.key: c for c in script.characters}
+        counts = {key: sum(line.speaker == key for line in lines) for key in non_narrator}
+        speaker_check["data"] = {
+            "limit": limit,
+            "actual": len(non_narrator),
+            "speakers": [
+                {"key": key,
+                 "name": characters_by_key[key].name if key in characters_by_key else key,
+                 "role": characters_by_key[key].role if key in characters_by_key else "supporting",
+                 "line_count": counts[key],
+                 "line_ids": [l.id for l in lines if l.speaker == key][:10]}
+                for key in sorted(non_narrator)
+            ],
+        }
+    checks.append(speaker_check)
+    if idea_constraints is not None:
+        checks.extend(_idea_constraints_checks(script, idea_constraints, known_concepts))
+    self_stage_directions = _speaker_self_stage_directions(script)
     checks.append(
         _check(
-            "speaker_limit",
-            len(non_narrator) <= limit,
-            f"{len(non_narrator)} speaking characters (max {limit} plus narrator)",
+            "dialogue_self_stage_direction",
+            not self_stage_directions,
+            "; ".join(self_stage_directions[:5]),
+            severity="major",
         )
     )
 
@@ -447,14 +574,7 @@ def validate_raw_script(raw: dict[str, Any], **kwargs: Any) -> tuple[Script | No
 # --------------------------------------------------------------------------- #
 # Story Critic pass rule
 # --------------------------------------------------------------------------- #
-# --- Borderline scores -----------------------------------------------------------------------
-# The rubric says: 4 = good with a small fix, 3 = a material weakness. A half-point miss (3.5) that
-# no blocker/major issue explains is the Critic disagreeing with its own rubric, and it is where most
-# pass/fail noise comes from. Such a dimension is "borderline": it is NOT accepted automatically.
-# The stage asks a narrow second question (see `s4_recheck.md`): can a concrete defect be pointed at
-# in a real line? Only a "no" (or a "yes" with no real line behind it) clears the dimension.
-# 3.0 or lower always fails. The mean is always computed from the RAW scores.
-BORDERLINE_FLOOR = 3.5
+# Scores below the unchanged threshold always fail. Evidence makes low scores auditable; it does not waive them.
 DIMENSION_CATEGORIES: dict[str, tuple[str, ...]] = {
     "coherence": ("continuity", "clarity", "concept", "redundancy"),
     "character_consistency": ("character", "stage_direction"),
@@ -468,25 +588,6 @@ DIMENSION_CATEGORIES: dict[str, tuple[str, ...]] = {
 }
 
 
-def critic_min_score() -> float:
-    return _env_float("S4_CRITIC_MIN_SCORE", CRITIC_MIN_SCORE)
-
-
-def borderline_dimensions(report: CriticReport, min_score: float | None = None) -> list[str]:
-    """Dimensions scored 3.5 (never lower) with no blocker/major issue in a related category."""
-    min_score = critic_min_score() if min_score is None else min_score
-    blocking = [i for i in report.issues if i.severity in ("blocker", "major")]
-    out = []
-    for k, v in report.scores.items():
-        if v >= min_score or v < BORDERLINE_FLOOR:
-            continue
-        related = DIMENSION_CATEGORIES.get(k, ())
-        backed = any(i.category is None or i.category == "other" or i.category in related for i in blocking)
-        if not backed:
-            out.append(k)
-    return out
-
-
 def evaluate_critic(
     report: CriticReport,
     *,
@@ -495,22 +596,14 @@ def evaluate_critic(
     verdicts: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
-    min_score = _env_float("S4_CRITIC_MIN_SCORE", CRITIC_MIN_SCORE)
-    min_mean = _env_float("S4_CRITIC_MIN_MEAN", CRITIC_MIN_MEAN)
-    max_explanatory = _env_float("S4_CRITIC_MAX_EXPLANATORY", CRITIC_MAX_EXPLANATORY)
+    min_score = CRITIC_MIN_SCORE
+    min_mean = CRITIC_MIN_MEAN
+    max_explanatory = CRITIC_MAX_EXPLANATORY
     scores = report.scores
     mean = sum(scores[k] for k in SCORE_KEYS) / len(SCORE_KEYS)
-
-    # `verdicts`: dimension -> True when the re-check confirmed a concrete defect, False when it
-    # found none. A borderline dimension is cleared only by an explicit False.
-    border = set(borderline_dimensions(report, min_score))
-    cleared = {k: v for k, v in scores.items() if k in border and verdicts is not None and verdicts.get(k) is False}
-    low = {k: v for k, v in scores.items() if v < min_score and k not in cleared}
-    note = f" (re-check found no concrete defect, so accepted as polish-only: {cleared})" if cleared else ""
-    checks.append(_check("critic_each_score", not low, f"scores below {min_score}: {low}{note}"))
-    checks.append(
-        _check("critic_mean_score", mean >= min_mean, f"mean {mean:.2f} (min {min_mean})")
-    )
+    low = {k: v for k, v in scores.items() if v < min_score}
+    checks.append(_check("critic_each_score", not low, f"scores below {min_score}: {low}"))
+    checks.append(_check("critic_mean_score", mean >= min_mean, f"mean {mean:.2f} (min {min_mean})"))
 
     cov = {c.concept_id: c for c in report.coverage}
     bad_must = []
@@ -523,6 +616,70 @@ def evaluate_critic(
     checks.append(
         _check("critic_must_as_plot_tool", not bad_must, "; ".join(bad_must))
     )
+
+    # Source fidelity is required for every must concept and every important
+    # concept the Critic says is used. The Critic
+    # must enumerate the cited teaching lines, state the claim, anchor it to
+    # the supplied source, and explicitly judge the relationship. This makes
+    # silent uncertainty or a wrong numeric example a repairable blocker.
+    cov_for_facts = {c.concept_id: c for c in report.coverage}
+    required_fact_concepts = concepts.ids("must") + [
+        cid for cid in concepts.ids("important")
+        if cid in cov_for_facts and cov_for_facts[cid].line_ids
+    ]
+    fact_problems: list[str] = []
+    non_coverage_fact_problems: list[str] = []
+    missing_fact_lines: dict[str, list[str]] = {}
+    known_concepts = set(concepts.ids())
+    real = {l.id for s_ in script.scenes for l in s_.lines} if script is not None else None
+    fact_by_concept: dict[str, list[Any]] = {}
+    for fact in report.fact_checks:
+        if fact.concept_id not in known_concepts:
+            fact_problems.append(f"unknown concept {fact.concept_id}")
+            non_coverage_fact_problems.append(f"unknown concept {fact.concept_id}")
+            continue
+        if real is not None:
+            invalid = [line_id for line_id in fact.line_ids if line_id not in real]
+            if invalid:
+                fact_problems.append(f"{fact.concept_id}: invalid fact-check line ids {invalid}")
+                non_coverage_fact_problems.append(
+                    f"{fact.concept_id}: invalid fact-check line ids {invalid}"
+                )
+        fact_by_concept.setdefault(fact.concept_id, []).append(fact)
+
+    for concept_id in required_fact_concepts:
+        entries = fact_by_concept.get(concept_id, [])
+        coverage_entry = cov_for_facts.get(concept_id)
+        if not entries:
+            fact_problems.append(f"{concept_id}: missing source-fact review")
+            non_coverage_fact_problems.append(f"{concept_id}: missing source-fact review")
+            continue
+        cited = {line_id for entry in entries for line_id in entry.line_ids}
+        uncovered = sorted(set(coverage_entry.line_ids if coverage_entry else []) - cited)
+        if uncovered:
+            fact_problems.append(f"{concept_id}: educational lines not fact-checked {uncovered}")
+            missing_fact_lines[concept_id] = uncovered
+        for entry in entries:
+            if entry.verdict != "supported":
+                fact_problems.append(
+                    f"{concept_id} {entry.line_ids}: {entry.verdict} claim '{entry.story_claim}' "
+                    f"against source '{entry.source_basis}'"
+                )
+                non_coverage_fact_problems.append(
+                    f"{concept_id} {entry.line_ids}: {entry.verdict} claim '{entry.story_claim}' "
+                    f"against source '{entry.source_basis}'"
+                )
+    fact_check = _check("critic_fact_accuracy", not fact_problems,
+                        "; ".join(fact_problems[:8]), severity="blocker")
+    # This metadata allows the pipeline to distinguish an incomplete evidence inventory from
+    # an actual contradiction/uncertain claim. Only the former can be supplemented by the
+    # independent source auditor; all other fact failures remain blocking.
+    fact_check["data"] = {
+        "missing_line_ids_by_concept": missing_fact_lines,
+        "supplementable_missing_coverage_only": bool(missing_fact_lines)
+        and not non_coverage_fact_problems,
+    }
+    checks.append(fact_check)
 
     if script is not None:
         # The Critic must point at real lines. A "plot_tool" claim with no existing line behind it
@@ -544,6 +701,22 @@ def evaluate_critic(
                 severity="major",
             )
         )
+        issue_evidence = [i for i in report.issues if i.line_id and i.line_id in real]
+        unsupported_low = []
+        for dimension, score in low.items():
+            categories = DIMENSION_CATEGORIES.get(dimension, ())
+            if not any(i.category in categories for i in issue_evidence):
+                unsupported_low.append(dimension)
+        invalid_issue_refs = [i.line_id for i in report.issues if i.line_id and i.line_id not in real]
+        unanchored_safety = [i.message for i in report.issues
+                             if i.category == "safety_culture" and (not i.line_id or i.line_id not in real)]
+        checks.append(_check(
+            "critic_score_evidence",
+            not unsupported_low and not invalid_issue_refs and not unanchored_safety,
+            f"low scores without category-matched real-line evidence: {unsupported_low}; "
+            f"invalid issue line ids: {invalid_issue_refs}; safety issues without a real line: {unanchored_safety}",
+            severity="major",
+        ))
 
     important = concepts.ids("important")
     if important:
@@ -568,12 +741,18 @@ def evaluate_critic(
     )
 
     blocking = [i for i in report.issues if i.severity in ("blocker", "major")]
+    recap_ids = set(script.recap_line_ids) if script is not None else set()
+    blocking.extend(
+        i for i in report.issues
+        if i.severity == "minor" and i.category == "redundancy" and i.line_id in recap_ids
+    )
     checks.append(
         _check(
             "critic_issues",
             not blocking,
             "; ".join(
-                f"[{i.severity}{'/' + i.category if i.category else ''}] {i.scene_id or ''} {i.line_id or ''} {i.message}".strip()
+                f"[{('major' if i.severity == 'minor' and i.category == 'redundancy' and i.line_id in recap_ids else i.severity)}"
+                f"{'/' + i.category if i.category else ''}] {i.scene_id or ''} {i.line_id or ''} {i.message}".strip()
                 for i in blocking
             ),
         )
@@ -585,3 +764,150 @@ def evaluate_critic(
             )
 
     return _result(checks, scores={**scores, "mean": round(mean, 2)})
+
+
+def evaluate_educational_accuracy(
+    report: EducationalAccuracyReport,
+    *,
+    concepts: Concepts,
+    script: Script,
+    source_text: str,
+    required_line_ids: set[str] | None = None,
+    required_lines_by_concept: dict[str, set[str]] | None = None,
+) -> dict[str, Any]:
+    """Require independent, source-quoted verification of concept-linked teaching claims."""
+    real_lines = {line.id for scene in script.scenes for line in scene.lines}
+    known = {concept.id: concept for concept in concepts.concepts}
+    target_concepts = set(concepts.ids("must", "important"))
+    reviewed: set[str] = set()
+    reviewed_by_concept: dict[str, set[str]] = {}
+    problems: list[str] = []
+    issues: list[dict[str, Any]] = []
+    for claim in report.claims:
+        if claim.concept_id not in target_concepts:
+            problems.append(f"claim references non-required/unknown concept {claim.concept_id}")
+        invalid = [line_id for line_id in claim.line_ids if line_id not in real_lines]
+        if invalid:
+            problems.append(f"{claim.concept_id}: invalid line ids {invalid}")
+        if claim.source_quote not in source_text:
+            problems.append(f"{claim.concept_id} {claim.line_ids}: source quote is not verbatim in lesson/concept input")
+        reviewed.update(line_id for line_id in claim.line_ids if line_id in real_lines)
+        reviewed_by_concept.setdefault(claim.concept_id, set()).update(
+            line_id for line_id in claim.line_ids if line_id in real_lines
+        )
+        if claim.verdict != "supported":
+            problems.append(f"{claim.concept_id} {claim.line_ids}: {claim.verdict} — {claim.claim}")
+            for line_id in claim.line_ids:
+                if line_id in real_lines:
+                    scene_id = line_id.split("_l", 1)[0]
+                    issues.append({
+                        "severity": "blocker", "category": "concept", "scene_id": scene_id,
+                        "line_id": line_id,
+                        "message": f"Independent source audit marked this claim {claim.verdict}: {claim.claim}",
+                        "fix_hint": "Correct the educational claim using the quoted lesson source and update dependent lines.",
+                    })
+    missing_concepts = sorted(target_concepts - {c.concept_id for c in report.claims})
+    if missing_concepts:
+        problems.append(f"missing accuracy review for concepts {missing_concepts}")
+    missing_critic_claims = sorted((required_line_ids or set()) - reviewed)
+    if missing_critic_claims:
+        problems.append(f"Critic-identified educational lines not independently reviewed {missing_critic_claims}")
+    if required_lines_by_concept:
+        for concept_id, line_ids in required_lines_by_concept.items():
+            missing = sorted(line_ids - reviewed_by_concept.get(concept_id, set()))
+            if missing:
+                problems.append(
+                    f"concept {concept_id}: educational lines not independently reviewed under that concept {missing}"
+                )
+    passed = not problems
+    return {
+        "passed": passed,
+        "checks": [_check("educational_accuracy_audit", passed, "; ".join(problems[:10]), severity="blocker")],
+        "issues": issues,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# safety audit (structured: the model extracts who does what, code decides)
+# --------------------------------------------------------------------------- #
+SAFEGUARD_MAX_LINE_DISTANCE = 2   # an adult's helping line must sit this close to the hazard line
+
+
+def evaluate_safety(report: SafetyReport, script: Script) -> dict[str, Any]:
+    """Pass/fail for the Safety Auditor's hazard list, with no word lists.
+
+    A hazard is acceptable when its handler is an adult from the script's own cast, or when the
+    claimed safeguard is backed by a real line: for `adult_helping` a line in the SAME scene, within
+    `SAFEGUARD_MAX_LINE_DISTANCE` lines, spoken by an adult character or naming one; for
+    `child_safe_tool` a real line of the same scene (the auditor judges what it says). Entries that
+    cite a line the script does not have cannot be checked and are ignored. An unknown or
+    "unspecified" handler is treated as a child: a story must not leave the actor ambiguous.
+    """
+    lines: dict[str, tuple[str, int, str, str]] = {}   # id -> (scene, index, speaker, normalized text)
+    for sc in script.scenes:
+        for idx, ln in enumerate(sc.lines):
+            lines[ln.id] = (sc.id, idx, ln.speaker, norm_ar(ln.text_display))
+    ages = {c.key: c.age_years for c in script.characters}
+    adult_keys = {c.key for c in script.characters if c.age_years >= 18}
+    adult_names = [norm_ar(c.name) for c in script.characters if c.age_years >= 18 and c.name]
+    real_line_ids = set(lines)
+    reviewed = set(report.reviewed_line_ids)
+    coverage_problems = []
+    if len(reviewed) != len(report.reviewed_line_ids):
+        coverage_problems.append("reviewed_line_ids contains duplicates")
+    missing_reviews = sorted(real_line_ids - reviewed)
+    invalid_reviews = sorted(reviewed - real_line_ids)
+    if missing_reviews:
+        coverage_problems.append(f"lines not reviewed: {missing_reviews[:8]}")
+    if invalid_reviews:
+        coverage_problems.append(f"review references nonexistent lines: {invalid_reviews[:8]}")
+
+    def is_adult_line(line_id: str) -> bool:
+        _, _, speaker, text = lines[line_id]
+        return speaker in adult_keys or any(n and n in text for n in adult_names)
+
+    problems: list[str] = []
+    minor_problems: list[str] = []
+    unsafe: list[dict[str, str]] = []
+    for h in report.hazards:
+        if h.line_id not in lines:
+            problems.append(f"hazard references nonexistent line {h.line_id}")
+            continue
+        if h.handler not in ages and h.handler != "unspecified":
+            problems.append(f"{h.line_id}: hazard handler '{h.handler}' is not in the cast")
+        scene_id, idx, _, _ = lines[h.line_id]
+        if ages.get(h.handler, 0) >= 18:
+            continue
+        reason = ""
+        if h.safeguard == "none":
+            reason = "no adult help or child-safe tool is shown"
+        else:
+            ref = h.safeguard_line_id
+            if not ref or ref not in lines:
+                reason = f"claimed safeguard ({h.safeguard}) cites no real line"
+            else:
+                ref_scene, ref_idx, _, _ = lines[ref]
+                if ref_scene != scene_id:
+                    reason = f"safeguard line {ref} is in another scene"
+                elif h.safeguard == "child_safe_tool" and ref == h.line_id:
+                    reason = "the hazard line cannot also serve as independent evidence that the tool is child-safe"
+                elif h.safeguard == "adult_helping":
+                    if abs(ref_idx - idx) > SAFEGUARD_MAX_LINE_DISTANCE:
+                        reason = f"adult line {ref} is too far from the hazard line"
+                    elif not is_adult_line(ref):
+                        reason = f"line {ref} neither is spoken by nor names an adult character"
+        # Risk is judged for this action, material, context and child's age by the auditor.
+        # A category label alone must not turn an explicitly minor everyday risk into a blocker.
+        if reason and h.risk == "minor":
+            # An everyday task with at most a scratch as the worst case: a warning, never a blocker.
+            minor_problems.append(f"{h.line_id} ({h.handler}): {h.hazard} - {reason}")
+        elif reason:
+            problems.append(f"{h.line_id} ({h.handler}): {h.hazard} - {reason}")
+            unsafe.append({"scene_id": scene_id, "line_id": h.line_id,
+                           "message": f"{h.hazard} - {reason}"})
+
+    problems = coverage_problems + problems
+    checks = [_check("safety_audit", not problems, "; ".join(problems[:6]), severity="blocker")]
+    if minor_problems:
+        checks.append(_check("safety_minor", False, "; ".join(minor_problems[:4]), severity="minor"))
+    return _result(checks, unsafe=unsafe)

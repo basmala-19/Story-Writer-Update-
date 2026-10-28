@@ -1,8 +1,9 @@
 """Aggregate S4 run log (JSON Lines): one row per attempt and one per run.
 
-Reading runs one at a time does not show which failure is most common. This log keeps the facts
-needed to count them: which rule failed, which issue categories the Critic and the continuity audit
-used, the scores, and the tokens each attempt cost. It never stores prompts or story text.
+Reading runs one at a time does not show which failure is most common. This log keeps the rules,
+issue categories, model scores, tokens, and compact safety/continuity/source-accuracy audit reports
+needed to review why a draft passed or failed. Full attempt scripts are opt-in via
+`S4_RUN_LOG_FULL_SCRIPTS=true`; prompts are never stored.
 """
 from __future__ import annotations
 
@@ -31,7 +32,8 @@ def _failed(validation: dict[str, Any] | None) -> list[dict[str, str]]:
     if not validation:
         return []
     return [
-        {"name": c["name"], "severity": c["severity"]}
+        {"name": c["name"], "severity": c["severity"],
+         "detail": str(c.get("detail", ""))[:1200]}
         for c in validation.get("checks", [])
         if not c["passed"] and c["severity"] != "minor"
     ]
@@ -44,6 +46,10 @@ def attempt_row(
     scores = dict((crit.get("scores") or {}))
     report_issues = list((rec.critic_report or {}).get("issues", []))
     audit_issues = list((rec.audit_report or {}).get("issues", []))
+    safety_issues = [
+        {"severity": "blocker", "category": "safety_culture"}
+        for u in (rec.safety_validation or {}).get("unsafe", [])
+    ]
     return {
         "type": "attempt",
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -53,25 +59,94 @@ def attempt_row(
         "attempt": rec.attempt,
         "passed": bool(rec.passed),
         "stage_reached": (
-            "critic" if rec.critic_report is not None
-            else "audit" if rec.audit_validation is not None
+            "educational_accuracy" if getattr(rec, "fact_accuracy_validation", None) is not None
+            else "audit" if (rec.audit_validation is not None or rec.safety_validation is not None)
+            else "critic" if rec.critic_report is not None
             else "code"
         ),
         "failed_code": _failed(rec.code_validation),
         "failed_review": _failed(rec.critic_validation),
         "scores": scores,
+        "critic_fact_checks": (rec.critic_report or {}).get("fact_checks", []),
+        "critic_issues": report_issues,
         "issue_categories": dict(Counter(i.get("category") or "uncategorised"
-                                         for i in report_issues + audit_issues
+                                         for i in report_issues + audit_issues + safety_issues
                                          if i.get("severity") in ("blocker", "major"))),
         "audit_majors": sum(1 for i in audit_issues if i.get("severity") == "major"),
-        "recheck": {
-            v.get("dimension"): bool(v.get("defect"))
-            for v in ((getattr(rec, "recheck_report", None) or {}).get("verdicts") or [])
-        },
+        "continuity_audit": rec.audit_report,
+        "continuity_validation": rec.audit_validation,
+        "safety_audit": rec.safety_report,
+        "safety_validation": rec.safety_validation,
+        "educational_accuracy_audit": getattr(rec, "fact_accuracy_report", None),
+        "educational_accuracy_validation": getattr(rec, "fact_accuracy_validation", None),
         "frozen_scenes": list(getattr(rec, "frozen_scenes", []) or []),
         "scope": getattr(rec, "scope", None),
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
+        "auditor_metrics": getattr(rec, "auditor_metrics", {}) or {},
+        # Full story snapshots can make logs large and may contain user-provided lesson content,
+        # so they are only emitted when explicitly enabled for a debugging run.
+        **({
+            "writer_raw_script": getattr(rec, "writer_raw_script", None),
+            "processed_script": getattr(rec, "script", None),
+        } if os.getenv("S4_RUN_LOG_FULL_SCRIPTS", "false").strip().lower() in {"1", "true", "yes", "on"} else {}),
+        **(_repair_debug_details(rec) if os.getenv("S4_RUN_LOG_REPAIR_DETAILS", "false").strip().lower()
+           in {"1", "true", "yes", "on"} else {}),
+        "auditor_issue_overlap": _approximate_auditor_issue_overlap(getattr(rec, "auditor_metrics", {}) or {}),
+    }
+
+
+
+def _repair_debug_details(rec: Any) -> dict[str, Any]:
+    """Opt-in trace of the feedback prepared for the next retry and this attempt's hard checks.
+
+    Feedback may contain lesson/story text, so it is excluded from logs unless explicitly enabled.
+    The compact validation snapshot makes it possible to see which constraints passed or failed
+    at each retry without storing the full script or full prompt.
+    """
+    validations = {}
+    for name, validation in (("code", getattr(rec, "code_validation", None)),
+                             ("critic", getattr(rec, "critic_validation", None))):
+        if not isinstance(validation, dict):
+            continue
+        validations[name] = {
+            "passed": validation.get("passed"),
+            "checks": [
+                {"name": check.get("name"), "passed": check.get("passed"),
+                 "severity": check.get("severity"), "detail": str(check.get("detail", ""))[:500],
+                 **({"data": check["data"]} if isinstance(check.get("data"), dict) else {})}
+                for check in validation.get("checks", [])
+                if isinstance(check, dict)
+                and (check.get("severity") in ("blocker", "major") or not check.get("passed", True))
+            ],
+        }
+    return {
+        "repair_feedback_for_next": getattr(rec, "feedback_for_next", None),
+        "repair_scope": getattr(rec, "scope", None),
+        "repair_validation_snapshot": validations,
+    }
+
+def _approximate_auditor_issue_overlap(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Approximate cross-auditor overlap by exact (line_id, category) keys, not semantics."""
+    owners: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for auditor, metric in metrics.items():
+        for issue in metric.get("issue_keys", []) if isinstance(metric, dict) else []:
+            line_id, category = issue.get("line_id"), issue.get("category")
+            if line_id and category:
+                owners[(str(line_id), str(category))].append(auditor)
+    shared = [
+        {"line_id": line_id, "category": category, "auditors": sorted(set(auditors))}
+        for (line_id, category), auditors in owners.items() if len(set(auditors)) > 1
+    ]
+    return {
+        "method": "approximate_exact_line_id_and_category_overlap; not semantic identity",
+        "shared_issue_keys": shared,
+        "unique_issue_keys_by_auditor": {
+            auditor: sum(1 for issue in metric.get("issue_keys", [])
+                         if issue.get("line_id") and issue.get("category")
+                         and len(set(owners.get((str(issue["line_id"]), str(issue["category"])), []))) == 1)
+            for auditor, metric in metrics.items() if isinstance(metric, dict)
+        },
     }
 
 

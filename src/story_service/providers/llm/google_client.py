@@ -71,8 +71,8 @@ class GoogleStudioLLM:
             provider="google",
             model=self.models[role],
             model_role=role,
-            tokens_in=getattr(metadata, "prompt_token_count", 0) or 0,
-            tokens_out=getattr(metadata, "candidates_token_count", 0) or 0,
+            tokens_in=getattr(metadata, "prompt_token_count", None) if metadata is not None else None,
+            tokens_out=getattr(metadata, "candidates_token_count", None) if metadata is not None else None,
         )
         self.usage.append(event)
         return response.text or ""

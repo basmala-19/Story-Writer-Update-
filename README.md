@@ -43,3 +43,12 @@ and the final script. It never displays environment variables or API keys.
 - `src/story_service/pipeline/prompts/s4_writer.md`, `s4_critic.md`: prompts
 - `tests/unit/test_s4_script.py`: golden, 19 mutations, critic rules, retries, injection
 - `docs/DECISIONS.md`: every ambiguity and how it was resolved
+- `src/story_service/pipeline/prompts/s4_safety.md`: Safety Auditor (hazard, handler, safeguard); `validators.script.evaluate_safety` judges it
+
+
+### Optional S4 repair debugging
+
+Set `S4_RUN_LOG_REPAIR_DETAILS=true` to include the feedback prepared for the next retry,
+the repair scope, and a compact snapshot of failed/hard validation checks in `logs/s4_runs.jsonl`.
+This can contain story or lesson text, so it is disabled by default. It does not log the full prompt
+or change repair prompts, validation thresholds, or retry behavior.

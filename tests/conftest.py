@@ -5,3 +5,6 @@ import pytest
 def _no_continuity_audit_by_default(monkeypatch):
     """Older tests script only the writer and critic; tests of the audit switch it on explicitly."""
     monkeypatch.setenv("S4_CONTINUITY_AUDIT", "0")
+    monkeypatch.setenv("S4_SAFETY_AUDIT", "0")  # tests of the safety audit switch it on explicitly
+    monkeypatch.setenv("S4_FACT_ACCURACY_AUDIT", "0")  # enabled explicitly in dedicated auditor tests
+    monkeypatch.setenv("S4_CRITIC_ADVISORY", "0")

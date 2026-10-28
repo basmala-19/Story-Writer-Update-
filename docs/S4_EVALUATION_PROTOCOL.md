@@ -11,10 +11,16 @@ usage/cost together for every measured run.
 1. **Code checks (deterministic):** schema, IDs, scene/line counts, actual speakers, spoken-text hygiene,
    duration, concept IDs/coverage, interaction placement, recap, and display/spoken similarity. These are
    not delegated to the LLM judge.
-2. **Critic checks (model-graded):** nine scores, must/important concept coverage, explanatory-line ratio,
-   and actionable issues. The Critic must count only line-level speakers and apply the 20% explanatory
-   line definition in `s4_critic.md`.
-3. **Human review (calibration):** review a fixed sample of scripts and label each issue as blocker/major/minor,
+2. **Critic checks (model-graded):** nine scores, must/important concept coverage, a preliminary source-
+   grounded claim inventory, explanatory-line ratio, and actionable issues. For claims with numbers or
+   relationships, the Critic independently recalculates and compares with the supplied lesson.
+3. **Independent educational-accuracy audit:** after Critic acceptance, a separate prompt/call reviews
+   concept-linked claims against the supplied source. It must quote the source verbatim and verify every
+   claim line the Critic identified. Missing, contradicted, uncertain, malformed or unavailable audits block
+   acceptance and return a repair request. This is model-based verification, not a mathematical proof.
+   The Critic must count only line-level speakers and apply the 25% explanatory line definition in
+   `s4_critic.md`.
+4. **Human review (calibration):** review a fixed sample of scripts and label each issue as blocker/major/minor,
    whether each must concept is a plot tool, and whether explanatory lines were counted consistently.
 
 ## Initial regression set
@@ -39,7 +45,7 @@ replacing old cases.
 - All deterministic blockers pass.
 - Every must concept is used as a plot tool before final resolution; mere mention/definition is insufficient.
 - Critic scores: each dimension >= 4.0 and mean >= 4.2, with no blocker/major issue.
-- Critic explanatory-line ratio <= 0.20.
+- Critic explanatory-line ratio <= 0.25.
 - Important concept coverage >= 80%.
 - A human reviewer checks every newly introduced failure and a sample of passing outputs before treating a
   prompt/model change as an improvement. A score increase alone is not sufficient.
@@ -54,7 +60,7 @@ replacing old cases.
    result, not only the best result.
 5. Manually label at least 20 critic judgments before tuning thresholds. Compare human and model labels using
    percent agreement and Cohen's kappa when there are enough labels/classes to make it meaningful.
-6. Do not run expensive generation experiments until tests, API configuration, and token budget are confirmed.
+6. Do not run expensive generation experiments until tests, API configuration, and token budget are confirmed. The comparison runner is available, but a live comparison requires a confirmed budget.
 7. Keep a change only when it improves human-reviewed quality without regressions in hard checks.
 
 ## Known limits
